@@ -2,6 +2,13 @@
 
 script_dir="$(dirname "$(realpath "$0")")"
 
+function retrieve() {
+    local fingerprint_file="$1"
+    local flag="$2"
+
+    python $script_dir/rag_solution.py retrieve $flag --top-k "$TOP_K" songslike-openai "$(cat "$fingerprint_file" | tail +5)"
+}
+
 # Accept as input a fingerprint file, perform a RAG search, and copy the audio files of the top results to an output directory.
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
@@ -29,10 +36,18 @@ fi
 mkdir -p "$OUTPUT_DIR"
 
 # Query by the contents of the fingerprint file, excluding the metadata (Author, title. etc) to avoid biasing the search results towards "same artist" matches
-python $script_dir/rag_solution.py retrieve --metadata --top-k "$TOP_K" songslike-openai "$(cat "$FINGERPRINT_FILE" | tail +5)" \
-    | tee $OUTPUT_DIR/rag-results.json | jq -r '.[].file_name' | sed 's/.fp.txt//' \
+retrieve "$FINGERPRINT_FILE" "--metadata" \
+    | tee $OUTPUT_DIR/__rag-results.json | jq -r '.[].file_name' | sed 's/.fp.txt//' \
     | while IFS= read -r f; do 
         find "$AUDIO_DIR" -name "$f.*" -exec cp {} "$OUTPUT_DIR" \;
       done
+    
+retrieve "$FINGERPRINT_FILE" "--full" > "$OUTPUT_DIR/__rag-full-matches.txt"
+
+# python $script_dir/rag_solution.py retrieve --metadata --top-k "$TOP_K" songslike-openai "$(cat "$FINGERPRINT_FILE" | tail +5)" \
+#     | tee $OUTPUT_DIR/rag-results.json | jq -r '.[].file_name' | sed 's/.fp.txt//' \
+#     | while IFS= read -r f; do 
+#         find "$AUDIO_DIR" -name "$f.*" -exec cp {} "$OUTPUT_DIR" \;
+#       done
 
 open "$OUTPUT_DIR"

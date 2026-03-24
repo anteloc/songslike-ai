@@ -17,12 +17,14 @@ Usage:
 
 import argparse
 import json
+import re
+from collections import Counter
 from pathlib import Path
 
 import chromadb
 import tiktoken
 from tqdm import tqdm
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core import VectorStoreIndex, Document
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
 
@@ -44,9 +46,88 @@ def create_index(collection_name: str = "my_rag_db") -> VectorStoreIndex:
 
 # ── 2. Indexing ───────────────────────────────────────────────────────────────
 
+TOKEN_TO_DESC: dict[str, str] = {
+    "bpm:slow": "slow tempo",
+    "bpm:mid":  "mid tempo",
+    "bpm:fast": "fast tempo",
+    "DOOM":     "high energy",
+    "voom":     "moderate energy",
+    "hmm":      "low energy",
+    "tsee":     "bright treble-heavy sound",
+    "tsing":    "bright upper-midrange sound",
+    "bwoom":    "dark bass-heavy sound",
+    "bzzra":    "noisy distorted timbre",
+    "ooh":      "pure tonal character",
+    "tak-tak":  "strong rhythmic percussive attacks",
+    "ahhh":     "smooth sustained character",
+    "shaa":     "broad spectral spread",
+    "weee":     "high-pitched dominant frequency",
+    "dum":      "bass dominant frequency",
+    "shhh":     "silence",
+    "mmm":      "uncharacterized sound",
+}
+
+_FP_TOKEN_RE = re.compile(r"\{([^}]+)\}")
+
+
+def fp_to_prose(fp_text: str) -> str:
+    """Convert a .fp.txt fingerprint to a single natural-language description."""
+    all_tokens: list[str] = []
+    for match in _FP_TOKEN_RE.finditer(fp_text):
+        all_tokens.extend(match.group(1).split())
+
+    if not all_tokens:
+        return ""
+
+    counts = Counter(all_tokens)
+    total = len(all_tokens)
+
+    # Extract unique lyric lines; skip NOTE block, index numbers, timestamps
+    in_note_block = False
+    lyrics: list[str] = []
+    seen: set[str] = set()
+    for line in fp_text.splitlines():
+        line = line.strip()
+        if line == "NOTE":
+            in_note_block = True
+            continue
+        if in_note_block:
+            if not line:
+                in_note_block = False
+            continue
+        if not line or line.isdigit() or "-->" in line:
+            continue
+        clean = _FP_TOKEN_RE.sub("", line).strip()
+        if clean and clean not in seen:
+            seen.add(clean)
+            lyrics.append(clean)
+
+    characteristics = [
+        TOKEN_TO_DESC[token]
+        for token, count in counts.most_common()
+        if count / total >= 0.05 and token in TOKEN_TO_DESC
+    ]
+
+    prose = "Music characteristics: " + ", ".join(characteristics) + "."
+    if lyrics:
+        prose += "\nLyrics: " + " / ".join(lyrics[:20])
+    return prose
+
+
 def index_directory(directory: str, index: VectorStoreIndex) -> None:
-    """Load every file in a folder and add it to the index."""
-    documents = SimpleDirectoryReader(directory).load_data()
+    """Convert .fp.txt files to prose and index one document per file."""
+    paths = [p for p in sorted(Path(directory).iterdir()) if p.is_file()]
+    documents = []
+    for path in paths:
+        prose = fp_to_prose(path.read_text(encoding="utf-8", errors="ignore"))
+        if not prose:
+            continue
+        documents.append(Document(
+            text=prose,
+            id_=str(path),
+            metadata={"file_path": str(path), "file_name": path.name},
+        ))
+
     for doc in tqdm(documents, desc="Indexing", unit="doc"):
         index.insert(doc)
     print(f"Indexed {len(documents)} document(s) from '{directory}'")
