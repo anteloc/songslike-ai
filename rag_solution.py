@@ -2,7 +2,7 @@
 RAG (Retrieval-Augmented Generation) for song similarity search — LlamaIndex + ChromaDB
 
 Install dependencies:
-    pip install llama-index llama-index-vector-stores-chroma chromadb openai tiktoken
+    pip install llama-index llama-index-vector-stores-chroma chromadb openai tiktoken tqdm
 
 Set your API key:
     export OPENAI_API_KEY="your-key-here"
@@ -16,10 +16,12 @@ Usage:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import chromadb
 import tiktoken
+from tqdm import tqdm
 from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
@@ -45,9 +47,9 @@ def create_index(collection_name: str = "my_rag_db") -> VectorStoreIndex:
 def index_directory(directory: str, index: VectorStoreIndex) -> None:
     """Load every file in a folder and add it to the index."""
     documents = SimpleDirectoryReader(directory).load_data()
-    for doc in documents:
+    for doc in tqdm(documents, desc="Indexing", unit="doc"):
         index.insert(doc)
-    print(f"✅ Indexed {len(documents)} document(s) from '{directory}'")
+    print(f"Indexed {len(documents)} document(s) from '{directory}'")
 
 
 # ── 3. Estimation ─────────────────────────────────────────────────────────────
@@ -93,7 +95,7 @@ def retrieve(question: str, index: VectorStoreIndex, top_k: int = 3) -> list[str
 # ── 5. CLI ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RAG search for similar songs.")
+    parser = argparse.ArgumentParser(description="RAG search for similar songs, for examples run: python rag_solution.py <command> --help")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     fmt = argparse.RawDescriptionHelpFormatter
@@ -122,6 +124,8 @@ def main() -> None:
     p_retrieve.add_argument("name")
     p_retrieve.add_argument("question")
     p_retrieve.add_argument("--top-k", type=int, default=3, metavar="K")
+    p_retrieve.add_argument("--full", "-f", action="store_true", help="Print the full chunk instead of the first 120 characters.")
+    p_retrieve.add_argument("--metadata", "-m", action="store_true", help="Output only metadata for each result in JSON format.")
 
     p_estimate = sub.add_parser("estimate", help="Estimate token counts for files in a directory.",
                                  formatter_class=fmt,
@@ -143,8 +147,13 @@ def main() -> None:
     elif args.cmd == "query":
         print(query(args.question, index, args.top_k))
     elif args.cmd == "retrieve":
-        for i, chunk in enumerate(retrieve(args.question, index, args.top_k), 1):
-            print(f"[{i}] {chunk[:120]}")
+        if args.metadata:
+            nodes = index.as_retriever(similarity_top_k=args.top_k).retrieve(args.question)
+            for i, node in enumerate(nodes, 1):
+                print(f"[{i}] {json.dumps(node.metadata, indent=2)}")
+        else:
+            for i, chunk in enumerate(retrieve(args.question, index, args.top_k), 1):
+                print(f"[{i}] {chunk if args.full else chunk[:120]}")
 
 
 if __name__ == "__main__":
