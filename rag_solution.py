@@ -1,15 +1,26 @@
 """
-Simple RAG (Retrieval-Augmented Generation) with LlamaIndex + ChromaDB
+RAG (Retrieval-Augmented Generation) for song similarity search — LlamaIndex + ChromaDB
 
 Install dependencies:
-    pip install llama-index llama-index-vector-stores-chroma chromadb openai
+    pip install llama-index llama-index-vector-stores-chroma chromadb openai tiktoken
 
 Set your API key:
     export OPENAI_API_KEY="your-key-here"
+
+Usage:
+    python rag_solution.py create <name>
+    python rag_solution.py index  <name> <directory>
+    python rag_solution.py query  <name> "upbeat celtic music" [--top-k 5]
+    python rag_solution.py retrieve <name> "upbeat celtic music" [--top-k 5]
+    python rag_solution.py estimate <directory>
 """
 
+import argparse
+from pathlib import Path
+
 import chromadb
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Document
+import tiktoken
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
 
@@ -39,14 +50,31 @@ def index_directory(directory: str, index: VectorStoreIndex) -> None:
     print(f"✅ Indexed {len(documents)} document(s) from '{directory}'")
 
 
-def index_text(text: str, index: VectorStoreIndex, doc_id: str = None) -> None:
-    """Add a raw text string directly to the index."""
-    doc = Document(text=text, id_=doc_id or text[:40])
-    index.insert(doc)
-    print(f"✅ Indexed text snippet: '{text[:60]}...'")
+# ── 3. Estimation ─────────────────────────────────────────────────────────────
+
+_ENCODER = tiktoken.get_encoding("cl100k_base")
 
 
-# ── 3. Querying ───────────────────────────────────────────────────────────────
+def estimate_directory(directory: str) -> None:
+    """Print per-file and total token counts in tokens / kt / Mt."""
+    rows = []
+    for path in sorted(Path(directory).iterdir()):
+        if not path.is_file():
+            continue
+        n = len(_ENCODER.encode(path.read_text(encoding="utf-8", errors="ignore")))
+        rows.append((path.name, n))
+
+    total = sum(n for _, n in rows)
+    width = max(len(name) for name, _ in rows) if rows else 0
+
+    for name, n in rows:
+        print(f"{name:<{width}}  {n:>10,} tokens  {n/1_000:>8.3f} kt  {n/1_000_000:>10.6f} Mt")
+
+    print("-" * (width + 42))
+    print(f"{'Total':<{width}}  {total:>10,} tokens  {total/1_000:>8.3f} kt  {total/1_000_000:>10.6f} Mt")
+
+
+# ── 4. Querying ───────────────────────────────────────────────────────────────
 
 def query(question: str, index: VectorStoreIndex, top_k: int = 3) -> str:
     """Ask a question; returns an LLM answer grounded in your documents."""
@@ -62,29 +90,62 @@ def retrieve(question: str, index: VectorStoreIndex, top_k: int = 3) -> list[str
     return [node.get_content() for node in nodes]
 
 
-# ── 4. Main demo ──────────────────────────────────────────────────────────────
+# ── 5. CLI ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RAG search for similar songs.")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    fmt = argparse.RawDescriptionHelpFormatter
+
+    p_create = sub.add_parser("create", help="Create a new empty named index.",
+                               formatter_class=fmt,
+                               epilog="example:\n  python rag_solution.py create songs")
+    p_create.add_argument("name")
+
+    p_index = sub.add_parser("index", help="Populate index from a directory (creates if needed).",
+                              formatter_class=fmt,
+                              epilog="example:\n  python rag_solution.py index songs ./srt_files/")
+    p_index.add_argument("name")
+    p_index.add_argument("directory")
+
+    p_query = sub.add_parser("query", help="Ask a question; returns an LLM-synthesized answer.",
+                              formatter_class=fmt,
+                              epilog="example:\n  python rag_solution.py query songs \"upbeat celtic music\" --top-k 5")
+    p_query.add_argument("name")
+    p_query.add_argument("question")
+    p_query.add_argument("--top-k", type=int, default=3, metavar="K")
+
+    p_retrieve = sub.add_parser("retrieve", help="Return raw matching chunks without LLM synthesis.",
+                                 formatter_class=fmt,
+                                 epilog="example:\n  python rag_solution.py retrieve songs \"upbeat celtic music\" --top-k 5")
+    p_retrieve.add_argument("name")
+    p_retrieve.add_argument("question")
+    p_retrieve.add_argument("--top-k", type=int, default=3, metavar="K")
+
+    p_estimate = sub.add_parser("estimate", help="Estimate token counts for files in a directory.",
+                                 formatter_class=fmt,
+                                 epilog="example:\n  python rag_solution.py estimate ./srt_files/")
+    p_estimate.add_argument("directory")
+
+    args = parser.parse_args()
+
+    if args.cmd == "estimate":
+        estimate_directory(args.directory)
+        return
+
+    index = create_index(args.name)
+
+    if args.cmd == "create":
+        print(f"Index '{args.name}' ready.")
+    elif args.cmd == "index":
+        index_directory(args.directory, index)
+    elif args.cmd == "query":
+        print(query(args.question, index, args.top_k))
+    elif args.cmd == "retrieve":
+        for i, chunk in enumerate(retrieve(args.question, index, args.top_k), 1):
+            print(f"[{i}] {chunk[:120]}")
+
 
 if __name__ == "__main__":
-    # --- Build / reconnect to the index ---
-    index = create_index("demo")
-
-    # --- Add some documents (pick one approach) ---
-
-    # Option A: index every file in a folder
-    # index_directory("./my_docs", index)
-
-    # Option B: index raw text snippets
-    index_text("The Eiffel Tower is located in Paris, France. It was built in 1889.", index)
-    index_text("Python was created by Guido van Rossum and first released in 1991.", index)
-    index_text("RAG stands for Retrieval-Augmented Generation. It combines search with LLMs.", index)
-
-    # --- Query with LLM answer ---
-    print("\n🔍 Query: 'Where is the Eiffel Tower?'")
-    answer = query("Where is the Eiffel Tower?", index)
-    print(f"💬 Answer: {answer}")
-
-    # --- Pure retrieval (no LLM) ---
-    print("\n📄 Raw chunks for 'What is RAG?':")
-    chunks = retrieve("What is RAG?", index)
-    for i, chunk in enumerate(chunks, 1):
-        print(f"  [{i}] {chunk[:120]}")
+    main()
