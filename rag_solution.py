@@ -201,9 +201,11 @@ def main() -> None:
 
     p_retrieve = sub.add_parser("retrieve", help="Return raw matching chunks without LLM synthesis.",
                                  formatter_class=fmt,
-                                 epilog="example:\n  python rag_solution.py retrieve songs \"upbeat celtic music\" --top-k 5")
+                                 epilog="example:\n  python rag_solution.py retrieve songs \"upbeat celtic music\" --top-k 5\n"
+                                        "  python rag_solution.py retrieve songs --file song.fp.txt --top-k 5")
     p_retrieve.add_argument("name")
-    p_retrieve.add_argument("question")
+    p_retrieve.add_argument("question", nargs="?", default=None)
+    p_retrieve.add_argument("--file", "-F", metavar="FILE", help="Use a .fp.txt fingerprint file as the query instead of a text question.")
     p_retrieve.add_argument("--top-k", type=int, default=3, metavar="K")
     p_retrieve.add_argument("--full", "-f", action="store_true", help="Print the full chunk instead of the first 120 characters.")
     p_retrieve.add_argument("--metadata", "-m", action="store_true", help="Output only metadata for each result in JSON format.")
@@ -228,11 +230,20 @@ def main() -> None:
     elif args.cmd == "query":
         print(query(args.question, index, args.top_k))
     elif args.cmd == "retrieve":
+        if args.file:
+            question = fp_to_prose(Path(args.file).read_text(encoding="utf-8"))
+            # remove the first 5 lines from the question, since they are artist, song, etc. metadata that may not be relevant to the search
+            question = "\n".join(question.splitlines()[5:])
+        elif args.question:
+            question = args.question
+        else:
+            p_retrieve.error("provide either a question or --file")
+
         if args.metadata:
-            nodes = index.as_retriever(similarity_top_k=args.top_k).retrieve(args.question)
+            nodes = index.as_retriever(similarity_top_k=args.top_k).retrieve(question)
             print(json.dumps([node.metadata for node in nodes], indent=2))
         else:
-            for i, chunk in enumerate(retrieve(args.question, index, args.top_k), 1):
+            for i, chunk in enumerate(retrieve(question, index, args.top_k), 1):
                 print(f"[{i}] {chunk if args.full else chunk[:120]}")
 
 

@@ -6,7 +6,7 @@ function retrieve() {
     local fingerprint_file="$1"
     local flag="$2"
 
-    python $script_dir/rag_solution.py retrieve $flag --top-k "$TOP_K" songslike-openai "$(cat "$fingerprint_file" | tail +5)"
+    python $script_dir/rag_solution.py retrieve $flag --top-k "$TOP_K" songslike-openai "$(cat "$fingerprint_file")"
 }
 
 # Accept as input a fingerprint file, perform a RAG search, and copy the audio files of the top results to an output directory.
