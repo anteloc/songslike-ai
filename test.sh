@@ -30,10 +30,8 @@ mkdir -p "$OUTPUT_DIR"
 
 # Query by the contents of the fingerprint file, excluding the metadata (Author, title. etc) to avoid biasing the search results towards "same artist" matches
 python $script_dir/rag_solution.py retrieve --metadata --top-k "$TOP_K" songslike-openai "$(cat "$FINGERPRINT_FILE" | tail +5)" \
-    | jq -r '.[].file_name' | sed 's/.fp.txt//' \
+    | tee $OUTPUT_DIR/rag-results.json | jq -r '.[].file_name' | sed 's/.fp.txt//' \
     | while IFS= read -r f; do 
-        # flac_file="${f}.flac"
-        # fp_file="${f}.fp.txt"
         find "$AUDIO_DIR" -name "$f.*" -exec cp {} "$OUTPUT_DIR" \;
       done
 
