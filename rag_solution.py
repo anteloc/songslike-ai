@@ -149,8 +149,7 @@ def main() -> None:
     elif args.cmd == "retrieve":
         if args.metadata:
             nodes = index.as_retriever(similarity_top_k=args.top_k).retrieve(args.question)
-            for i, node in enumerate(nodes, 1):
-                print(f"[{i}] {json.dumps(node.metadata, indent=2)}")
+            print(json.dumps([node.metadata for node in nodes], indent=2))
         else:
             for i, chunk in enumerate(retrieve(args.question, index, args.top_k), 1):
                 print(f"[{i}] {chunk if args.full else chunk[:120]}")
