@@ -25,6 +25,7 @@ TIME_RE = re.compile(
     r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
 LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})\.(\d{2})\]")
+LRC_META_RE = re.compile(r"\[(\w+):(.+)\]")
 
 
 def parse_timestamp_to_ms(h: str, m: str, s: str, ms: str) -> int:
@@ -88,6 +89,18 @@ def parse_srt(srt_text: str) -> List[SubtitleEntry]:
     return entries
 
 
+def parse_lrc_meta(lrc_text: str) -> dict[str, str]:
+    tag_map = {"ar": "Artist", "ti": "Title", "al": "Album"}
+    meta: dict[str, str] = {}
+    for line in lrc_text.splitlines():
+        match = LRC_META_RE.match(line.strip())
+        if match and not LRC_TIME_RE.match(line.strip()):
+            key, value = match.group(1).lower(), match.group(2).strip()
+            if key in tag_map:
+                meta[tag_map[key]] = value
+    return meta
+
+
 def parse_lrc(lrc_text: str) -> List[SubtitleEntry]:
     timed: List[tuple[int, str]] = []
     for line in lrc_text.splitlines():
@@ -110,17 +123,20 @@ def parse_lrc(lrc_text: str) -> List[SubtitleEntry]:
     return entries
 
 
-def write_output(entries: List[SubtitleEntry], no_ts: bool = False) -> str:
+def write_output(
+    entries: List[SubtitleEntry],
+    no_ts: bool = False,
+    meta: dict[str, str] | None = None,
+) -> str:
     blocks = []
+
+    if meta:
+        note_lines = ["NOTE"] + [f"{k}: {v}" for k, v in meta.items()]
+        blocks.append("\n".join(note_lines))
 
     for i, entry in enumerate(entries, start=1):
         if no_ts:
-            block = "\n".join(
-                [
-                    str(i),
-                    entry.text,
-                ]
-            )
+            block = "\n".join([str(i), entry.text])
         else:
             block = "\n".join(
                 [
@@ -340,7 +356,12 @@ def main() -> int:
         return 1
 
     lyrics_text = lyrics_path.read_text(encoding="utf-8")
-    lyric_entries = parse_srt(lyrics_text) if suffix == ".srt" else parse_lrc(lyrics_text)
+    if suffix == ".srt":
+        lyric_entries = parse_srt(lyrics_text)
+        meta = None
+    else:
+        lyric_entries = parse_lrc(lyrics_text)
+        meta = parse_lrc_meta(lyrics_text) or None
 
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
     sr = int(sr)
@@ -377,7 +398,7 @@ def main() -> int:
             )
         )
 
-    output_text = write_output(output_entries, no_ts=args.no_ts)
+    output_text = write_output(output_entries, no_ts=args.no_ts, meta=meta)
     output_path.write_text(output_text, encoding="utf-8")
 
     if args.no_ts:
