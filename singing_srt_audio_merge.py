@@ -24,6 +24,7 @@ class SubtitleEntry:
 TIME_RE = re.compile(
     r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
 )
+LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})\.(\d{2})\]")
 
 
 def parse_timestamp_to_ms(h: str, m: str, s: str, ms: str) -> int:
@@ -84,6 +85,28 @@ def parse_srt(srt_text: str) -> List[SubtitleEntry]:
         )
 
     entries.sort(key=lambda e: (e.start_ms, e.end_ms))
+    return entries
+
+
+def parse_lrc(lrc_text: str) -> List[SubtitleEntry]:
+    timed: List[tuple[int, str]] = []
+    for line in lrc_text.splitlines():
+        line = line.strip()
+        match = LRC_TIME_RE.match(line)
+        if not match:
+            continue
+        m, s, cs = match.groups()
+        start_ms = int(m) * 60000 + int(s) * 1000 + int(cs) * 10
+        text = line[match.end():].strip()
+        if text:
+            timed.append((start_ms, text))
+
+    entries: List[SubtitleEntry] = []
+    for i, (start_ms, text) in enumerate(timed):
+        end_ms = timed[i + 1][0] if i + 1 < len(timed) else int(1e9)
+        if end_ms <= start_ms:
+            continue
+        entries.append(SubtitleEntry(index=i + 1, start_ms=start_ms, end_ms=end_ms, text=text))
     return entries
 
 
@@ -285,7 +308,7 @@ def parse_args() -> argparse.Namespace:
         description="Merge lyric subtitles with fake sung instrument-imitating syllables."
     )
     parser.add_argument("input_audio", help="Input audio file, e.g. song.mp3 or song.flac, etc.")
-    parser.add_argument("input_srt", help="Input lyric SRT file")
+    parser.add_argument("input_lyrics", help="Input lyric file (.srt or .lrc)")
     parser.add_argument("output_file", help="Output file path")
     parser.add_argument(
         "-n",
@@ -300,19 +323,24 @@ def main() -> int:
     args = parse_args()
 
     audio_path = Path(args.input_audio)
-    input_srt_path = Path(args.input_srt)
+    lyrics_path = Path(args.input_lyrics)
     output_path = Path(args.output_file)
 
     if not audio_path.exists():
         print(f"Error: audio file not found: {audio_path}")
         return 1
 
-    if not input_srt_path.exists():
-        print(f"Error: SRT file not found: {input_srt_path}")
+    if not lyrics_path.exists():
+        print(f"Error: lyrics file not found: {lyrics_path}")
         return 1
 
-    srt_text = input_srt_path.read_text(encoding="utf-8")
-    lyric_entries = parse_srt(srt_text)
+    suffix = lyrics_path.suffix.lower()
+    if suffix not in (".srt", ".lrc"):
+        print(f"Error: unsupported lyrics format '{suffix}' (expected .srt or .lrc)")
+        return 1
+
+    lyrics_text = lyrics_path.read_text(encoding="utf-8")
+    lyric_entries = parse_srt(lyrics_text) if suffix == ".srt" else parse_lrc(lyrics_text)
 
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
     sr = int(sr)
