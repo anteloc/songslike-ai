@@ -181,42 +181,31 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     """
     Return fake sung syllables that imitate the sound of the segment.
     """
-    if y.size == 0:
-        return "shhh"
-
-    peak = float(np.max(np.abs(y))) if y.size else 0.0
-    if peak < 1e-5:
+    if y.size == 0 or float(np.max(np.abs(y))) < 1e-5:
         return "shhh"
 
     eps = 1e-10
 
     rms = float(np.sqrt(np.mean(y ** 2) + eps))
-    centroid = safe_mean(librosa.feature.spectral_centroid(y=y, sr=sr))
-    bandwidth = safe_mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
-    rolloff = safe_mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
-    flatness = safe_mean(librosa.feature.spectral_flatness(y=y))
     zcr = safe_mean(librosa.feature.zero_crossing_rate(y))
 
+    # Single STFT pass — reused by all spectral features
+    S = np.abs(librosa.stft(y))
+    centroid = safe_mean(librosa.feature.spectral_centroid(S=S, sr=sr))
+    bandwidth = safe_mean(librosa.feature.spectral_bandwidth(S=S, sr=sr))
+    rolloff = safe_mean(librosa.feature.spectral_rolloff(S=S, sr=sr))
+    flatness = safe_mean(librosa.feature.spectral_flatness(S=S))
+
+    # Onset strength + peak-to-mean ratio as percussiveness indicator (replaces HPSS)
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    onset_strength = safe_mean(onset_env)
+    onset_mean = safe_mean(onset_env)
+    onset_peak_ratio = (float(onset_env.max()) if onset_env.size else 0.0) / (onset_mean + eps)
 
-    y_harm, y_perc = librosa.effects.hpss(y)
-    harm_energy = float(np.sqrt(np.mean(y_harm ** 2) + eps))
-    perc_energy = float(np.sqrt(np.mean(y_perc ** 2) + eps))
-
-    try:
-        f0, voiced_flag, _ = librosa.pyin(
-            y,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7"),
-            sr=sr,
-        )
-        voiced_f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
-        mean_f0 = safe_mean(voiced_f0) if voiced_f0.size else 0.0
-        voiced_ratio = float(np.mean(voiced_flag)) if voiced_flag is not None else 0.0
-    except Exception:
-        mean_f0 = 0.0
-        voiced_ratio = 0.0
+    # Dominant frequency via FFT peak (replaces expensive pyin)
+    mean_mag = S.mean(axis=1)
+    mean_mag[0] = 0.0  # exclude DC
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=(S.shape[0] - 1) * 2)
+    peak_freq = float(freqs[np.argmax(mean_mag)])
 
     syllables: List[str] = []
 
@@ -236,20 +225,20 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
 
     if flatness > 0.25 or zcr > 0.18:
         syllables.append("bzzra")
-    elif bandwidth < 1200 and voiced_ratio > 0.35:
+    elif bandwidth < 1200 and flatness < 0.12:
         syllables.append("ooh")
 
-    if onset_strength > 8.0 or perc_energy > harm_energy * 1.15:
+    if onset_mean > 8.0 or onset_peak_ratio > 3.5:
         syllables.append("tak-tak")
-    elif harm_energy > perc_energy * 1.2:
+    else:
         syllables.append("ahhh")
 
     if bandwidth > 2200 or rolloff > 5500:
         syllables.append("shaa")
 
-    if mean_f0 > 550:
+    if peak_freq > 550:
         syllables.append("weee")
-    elif 0 < mean_f0 < 180:
+    elif 0 < peak_freq < 180:
         syllables.append("dum")
 
     seen = set()
@@ -275,7 +264,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Merge lyric subtitles with fake sung instrument-imitating syllables."
     )
-    parser.add_argument("input_audio", help="Input audio file, e.g. song.mp3")
+    parser.add_argument("input_audio", help="Input audio file, e.g. song.mp3 or song.flac, etc.")
     parser.add_argument("input_srt", help="Input lyric SRT file")
     parser.add_argument("output_file", help="Output file path")
     parser.add_argument(
