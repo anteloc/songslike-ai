@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
+import math
 import sys
 import re
 import argparse
@@ -177,6 +178,25 @@ def build_full_timeline_entries(
     return cleaned
 
 
+SUBWINDOW_MS = 4000  # max segment duration before subdivision
+
+
+def subdivide_segments(entries: List[SubtitleEntry], max_ms: int) -> List[SubtitleEntry]:
+    result: List[SubtitleEntry] = []
+    for entry in entries:
+        duration = entry.end_ms - entry.start_ms
+        if duration <= max_ms:
+            result.append(entry)
+            continue
+        n = math.ceil(duration / max_ms)
+        window = duration // n
+        for i in range(n):
+            start = entry.start_ms + i * window
+            end = entry.start_ms + (i + 1) * window if i < n - 1 else entry.end_ms
+            result.append(SubtitleEntry(index=0, start_ms=start, end_ms=end, text=entry.text))
+    return result
+
+
 def analyze_segment(y: np.ndarray, sr: int) -> str:
     """
     Return fake sung syllables that imitate the sound of the segment.
@@ -228,7 +248,7 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     elif bandwidth < 1200 and flatness < 0.12:
         syllables.append("ooh")
 
-    if onset_mean > 8.0 or onset_peak_ratio > 3.5:
+    if onset_mean > 8.0 or (onset_mean > 3.0 and onset_peak_ratio > 5.0):
         syllables.append("tak-tak")
     else:
         syllables.append("ahhh")
@@ -295,9 +315,20 @@ def main() -> int:
     lyric_entries = parse_srt(srt_text)
 
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+    sr = int(sr)
     audio_duration_ms = int(len(y) * 1000 / sr)
 
+    tempo_val, _ = librosa.beat.beat_track(y=y, sr=sr)
+    bpm = float(np.atleast_1d(tempo_val)[0])
+    if bpm < 90:
+        tempo_token = "bpm:slow"
+    elif bpm < 130:
+        tempo_token = "bpm:mid"
+    else:
+        tempo_token = "bpm:fast"
+
     timeline_entries = build_full_timeline_entries(lyric_entries, audio_duration_ms)
+    timeline_entries = subdivide_segments(timeline_entries, SUBWINDOW_MS)
 
     output_entries: List[SubtitleEntry] = []
 
@@ -306,7 +337,7 @@ def main() -> int:
         end_sample = ms_to_sample(entry.end_ms, sr, len(y))
         segment = y[start_sample:end_sample]
 
-        sound_description = analyze_segment(segment, sr)
+        sound_description = f"{tempo_token} {analyze_segment(segment, sr)}"
         merged_text = combine_text(entry.text, sound_description)
 
         output_entries.append(
