@@ -33,6 +33,12 @@ lrc_default_file="$audio_file_dir/$lrc_default_filename"
 
 lrc_file="${2:-$lrc_default_file}"
 
+# if the output LRC file already exists, skip downloading
+if [ -f "$lrc_file" ]; then
+    echo "LRC file '$lrc_file' already exists. Skipping download."
+    exit 0
+fi
+
 # get the track info: duration, title, artist, album
 track_info="$(ffprobe -v error -show_entries format=duration:format_tags=title,artist,album -of csv=p=0:s='|' "$audio_file")"
 duration=$(echo "$track_info" | cut -d '|' -f 1)

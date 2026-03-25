@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 from __future__ import annotations
 
 import math
@@ -51,12 +52,10 @@ def format_ms_to_timestamp(ms: int) -> str:
 def parse_srt(srt_text: str) -> List[SubtitleEntry]:
     blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
     entries: List[SubtitleEntry] = []
-
     for block in blocks:
         lines = [line.rstrip("\n\r") for line in block.splitlines() if line.strip() != ""]
         if len(lines) < 2:
             continue
-
         try:
             index = int(lines[0].strip())
             time_line = lines[1].strip()
@@ -72,7 +71,6 @@ def parse_srt(srt_text: str) -> List[SubtitleEntry]:
 
         start_ms = parse_timestamp_to_ms(*match.groups()[0:4])
         end_ms = parse_timestamp_to_ms(*match.groups()[4:8])
-
         if end_ms <= start_ms:
             continue
 
@@ -84,7 +82,6 @@ def parse_srt(srt_text: str) -> List[SubtitleEntry]:
                 text=text,
             )
         )
-
     entries.sort(key=lambda e: (e.start_ms, e.end_ms))
     return entries
 
@@ -127,11 +124,15 @@ def write_output(
     entries: List[SubtitleEntry],
     no_ts: bool = False,
     meta: dict[str, str] | None = None,
+    global_tokens: dict[str, str] | None = None,
 ) -> str:
     blocks = []
-
-    if meta:
-        note_lines = ["NOTE"] + [f"{k}: {v}" for k, v in meta.items()]
+    if meta or global_tokens:
+        note_lines = ["NOTE"]
+        if meta:
+            note_lines += [f"{k}: {v}" for k, v in meta.items()]
+        if global_tokens:
+            note_lines += [f"{k}: {v}" for k, v in global_tokens.items()]
         blocks.append("\n".join(note_lines))
 
     for i, entry in enumerate(entries, start=1):
@@ -199,12 +200,10 @@ def build_full_timeline_entries(
         end_ms = max(0, min(entry.end_ms, audio_duration_ms))
         if end_ms <= start_ms:
             continue
-
         if cleaned and start_ms < cleaned[-1].end_ms:
             start_ms = cleaned[-1].end_ms
-            if end_ms <= start_ms:
-                continue
-
+        if end_ms <= start_ms:
+            continue
         cleaned.append(
             SubtitleEntry(
                 index=0,
@@ -213,7 +212,6 @@ def build_full_timeline_entries(
                 text=entry.text,
             )
         )
-
     return cleaned
 
 
@@ -236,6 +234,50 @@ def subdivide_segments(entries: List[SubtitleEntry], max_ms: int) -> List[Subtit
     return result
 
 
+# ---------------------------------------------------------------------------
+# Song-level global analysis (key, mode, tempo) — run once on full audio
+# ---------------------------------------------------------------------------
+
+_KEY_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+# Major and minor scale templates (Krumhansl-Kessler profiles, simplified)
+_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                            2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                            2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def detect_key_and_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
+    """
+    Detect the dominant musical key and mode (major/minor) from full-song audio.
+    Returns (key_token, mode_token), e.g. ("key:D", "mode:minor").
+    """
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    mean_chroma = chroma.mean(axis=1)  # shape (12,)
+
+    best_key = 0
+    best_mode = "major"
+    best_score = -np.inf
+
+    for root in range(12):
+        major_score = float(np.dot(np.roll(_MAJOR_PROFILE, root), mean_chroma))
+        minor_score = float(np.dot(np.roll(_MINOR_PROFILE, root), mean_chroma))
+        if major_score > best_score:
+            best_score = major_score
+            best_key = root
+            best_mode = "major"
+        if minor_score > best_score:
+            best_score = minor_score
+            best_key = root
+            best_mode = "minor"
+
+    return f"key:{_KEY_NAMES[best_key]}", f"mode:{best_mode}"
+
+
+# ---------------------------------------------------------------------------
+# Segment-level analysis
+# ---------------------------------------------------------------------------
+
 def analyze_segment(y: np.ndarray, sr: int) -> str:
     """
     Return fake sung syllables that imitate the sound of the segment.
@@ -255,26 +297,36 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     rolloff = safe_mean(librosa.feature.spectral_rolloff(S=S, sr=sr))
     flatness = safe_mean(librosa.feature.spectral_flatness(S=S))
 
-    # Onset strength + peak-to-mean ratio as percussiveness indicator (replaces HPSS)
+    # Onset strength + peak-to-mean ratio as percussiveness indicator
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
     onset_mean = safe_mean(onset_env)
     onset_peak_ratio = (float(onset_env.max()) if onset_env.size else 0.0) / (onset_mean + eps)
 
-    # Dominant frequency via FFT peak (replaces expensive pyin)
+    # Dominant frequency via FFT peak
     mean_mag = S.mean(axis=1)
     mean_mag[0] = 0.0  # exclude DC
     freqs = librosa.fft_frequencies(sr=sr, n_fft=(S.shape[0] - 1) * 2)
     peak_freq = float(freqs[np.argmax(mean_mag)])
 
+    # --- Harmonic vs. percussive energy ratio ---
+    # Use HPSS to split harmonic and percussive components
+    y_harm, y_perc = librosa.effects.hpss(y)
+    total_power = float(np.mean(y ** 2)) + eps
+    harm_ratio = float(np.mean(y_harm ** 2)) / total_power
+
     syllables: List[str] = []
 
-    if rms > 0.18:
+    # --- Energy: 4 tiers (tightened thresholds) ---
+    if rms > 0.20:
         syllables.append("DOOM")
-    elif rms > 0.08:
+    elif rms > 0.10:
         syllables.append("voom")
+    elif rms > 0.04:
+        syllables.append("meh")
     else:
         syllables.append("hmm")
 
+    # --- Spectral centroid ---
     if centroid > 3200:
         syllables.append("tsee")
     elif centroid > 1800:
@@ -282,19 +334,30 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     else:
         syllables.append("bwoom")
 
+    # --- Tonal character ---
     if flatness > 0.25 or zcr > 0.18:
         syllables.append("bzzra")
     elif bandwidth < 1200 and flatness < 0.12:
         syllables.append("ooh")
 
+    # --- Harmonic vs. percussive character ---
+    if harm_ratio > 0.70:
+        syllables.append("tonal")
+    elif harm_ratio < 0.30:
+        syllables.append("noisy")
+    # else: mixed — no extra token needed
+
+    # --- Rhythmic attacks ---
     if onset_mean > 8.0 or (onset_mean > 3.0 and onset_peak_ratio > 5.0):
         syllables.append("tak-tak")
     else:
         syllables.append("ahhh")
 
+    # --- Spectral spread / brightness ---
     if bandwidth > 2200 or rolloff > 5500:
         syllables.append("shaa")
 
+    # --- Peak frequency ---
     if peak_freq > 550:
         syllables.append("weee")
     elif 0 < peak_freq < 180:
@@ -313,7 +376,6 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
 def combine_text(lyric_text: str, sound_text: str) -> str:
     lyric_text = lyric_text.strip()
     sound_text = sound_text.strip()
-
     if lyric_text:
         return f"{lyric_text} {{{sound_text}}}"
     return f"{{{sound_text}}}"
@@ -356,6 +418,7 @@ def main() -> int:
         return 1
 
     lyrics_text = lyrics_path.read_text(encoding="utf-8")
+
     if suffix == ".srt":
         lyric_entries = parse_srt(lyrics_text)
         meta = None
@@ -367,6 +430,7 @@ def main() -> int:
     sr = int(sr)
     audio_duration_ms = int(len(y) * 1000 / sr)
 
+    # --- Global tempo ---
     tempo_val, _ = librosa.beat.beat_track(y=y, sr=sr)
     bpm = float(np.atleast_1d(tempo_val)[0])
     if bpm < 90:
@@ -376,16 +440,26 @@ def main() -> int:
     else:
         tempo_token = "bpm:fast"
 
+    # --- Global key and mode (song-level, computed once) ---
+    key_token, mode_token = detect_key_and_mode(y, sr)
+
+    # Collect global tokens to embed in the NOTE block
+    global_tokens: dict[str, str] = {
+        "Tempo": tempo_token,
+        "Key": key_token,
+        "Mode": mode_token,
+    }
+
     timeline_entries = build_full_timeline_entries(lyric_entries, audio_duration_ms)
     timeline_entries = subdivide_segments(timeline_entries, SUBWINDOW_MS)
 
     output_entries: List[SubtitleEntry] = []
-
     for entry in timeline_entries:
         start_sample = ms_to_sample(entry.start_ms, sr, len(y))
         end_sample = ms_to_sample(entry.end_ms, sr, len(y))
         segment = y[start_sample:end_sample]
 
+        # Segment-level sound tokens include tempo token for continuity
         sound_description = f"{tempo_token} {analyze_segment(segment, sr)}"
         merged_text = combine_text(entry.text, sound_description)
 
@@ -398,7 +472,7 @@ def main() -> int:
             )
         )
 
-    output_text = write_output(output_entries, no_ts=args.no_ts, meta=meta)
+    output_text = write_output(output_entries, no_ts=args.no_ts, meta=meta, global_tokens=global_tokens)
     output_path.write_text(output_text, encoding="utf-8")
 
     if args.no_ts:
