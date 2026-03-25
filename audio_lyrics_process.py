@@ -184,8 +184,10 @@ def ms_to_sample(ms: int, sr: int, total_samples: int) -> int:
     return max(0, min(int(ms * sr / 1000), total_samples))
 
 
+SAMPLE_RATE  = 11025  # vs 22050: 4× smaller STFT matrix, all spectral computation proportionally faster
+N_FFT        = 1024   # keeps Hz/bin resolution identical to (22050, 2048) while halving bin count
+HOP_LENGTH   = 512    # STFT hop; all frame-aligned features share this value
 SUBWINDOW_MS = 4000
-HOP_LENGTH   = 512   # STFT hop; all frame-aligned features share this value
 
 
 def build_timeline(
@@ -272,18 +274,23 @@ def safe_mean(arr: np.ndarray) -> float:
 
 
 def analyze_segment(
-    y: np.ndarray,         # time-domain slice — silence check + RMS only
-    S: np.ndarray,         # magnitude STFT slice  [n_bins, n_frames]
-    H: np.ndarray,         # harmonic magnitude STFT slice  [n_bins, n_frames]
-    zcr_frames: np.ndarray,# ZCR frame slice  [n_frames]
-    onset_env: np.ndarray, # onset envelope slice  [n_frames]
-    freqs: np.ndarray,     # frequency bin centres  [n_bins]  — constant across segments
-    sr: int,
+    y: np.ndarray,       # time-domain slice — silence check + RMS only
+    zcr: float,
+    onset_mean: float,
+    onset_peak_ratio: float,
+    centroid: float,
+    bandwidth: float,
+    rolloff: float,
+    flatness: float,
+    warmth_ratio: float,
+    harm_ratio: float,
+    peak_freq: float,
 ) -> str:
     """Return a musician-style natural-language description for a single audio segment.
 
-    All heavy arrays (S, H, zcr_frames, onset_env) are precomputed globally in
-    process_song and sliced to this segment's frame range before calling here.
+    All acoustic features are precomputed globally in process_song and passed as
+    scalar means over the segment's frame range. This function is pure classification —
+    no librosa calls, no array operations beyond the RMS on the time-domain slice.
 
     Features and their descriptors:
       - RMS energy          → explosive / loud / moderate / soft
@@ -298,29 +305,7 @@ def analyze_segment(
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-5:
         return "silence"
 
-    eps = 1e-10
-
-    rms = float(np.sqrt(np.mean(y ** 2) + eps))
-    zcr = safe_mean(zcr_frames)
-
-    centroid  = safe_mean(librosa.feature.spectral_centroid(S=S, sr=sr))
-    bandwidth = safe_mean(librosa.feature.spectral_bandwidth(S=S, sr=sr))
-    rolloff   = safe_mean(librosa.feature.spectral_rolloff(S=S, sr=sr))
-    flatness  = safe_mean(librosa.feature.spectral_flatness(S=S))
-
-    onset_mean       = safe_mean(onset_env)
-    onset_peak_ratio = (float(onset_env.max()) if onset_env.size else 0.0) / (onset_mean + eps)
-
-    mean_mag    = S.mean(axis=1).copy()
-    mean_mag[0] = 0.0   # zero DC bin — not musically meaningful
-    peak_freq   = float(freqs[np.argmax(mean_mag)])
-
-    # Warmth: 200–800 Hz band energy relative to overall mean
-    low_mid_mask = (freqs >= 200) & (freqs <= 800)
-    warmth_ratio = float(S[low_mid_mask].mean()) / (float(S.mean()) + eps)
-
-    # Harmonic ratio from precomputed HPSS — equivalent to time-domain ratio by Parseval
-    harm_ratio = float(np.mean(H ** 2)) / (float(np.mean(S ** 2)) + eps)
+    rms = float(np.sqrt(np.mean(y ** 2) + 1e-10))
 
     parts: list[str] = []
 
@@ -368,8 +353,8 @@ def analyze_segment(
     else:
         parts.append("smooth")
 
-    # Spectral spread
-    if bandwidth > 2200 or rolloff > 5500:
+    # Spectral spread (rolloff threshold lowered from 5500 → 4000: Nyquist is now 5512 Hz)
+    if bandwidth > 2200 or rolloff > 4000:
         parts.append("full")
 
     # Peak frequency
@@ -410,18 +395,42 @@ def process_song(
         meta          = None
 
     # ── Load audio ────────────────────────────────────────────────────────
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    y, sr = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
     sr = int(sr)
     audio_duration_ms = int(len(y) * 1000 / sr)
 
-    # ── Precompute all expensive features once from the full audio ────────
-    # Every per-segment call previously recomputed STFT, HPSS, onset, and ZCR.
-    # Here we compute each once and slice by frame range inside the loop.
-    S_full    = np.abs(librosa.stft(y, hop_length=HOP_LENGTH))
-    H_full, _ = librosa.decompose.hpss(S_full)
+    # ── Precompute all features once from the full audio ──────────────────
+    #
+    # Strategy: compute every expensive feature globally, store as per-frame
+    # 1-D arrays, then reduce each to a scalar mean per segment in the loop.
+    # This eliminates all librosa calls from the inner loop entirely.
+    #
+    # STFT: n_fft=N_FFT (1024) + sr=SAMPLE_RATE (11025) keeps the same
+    # Hz/bin resolution as the old (2048, 22050) while producing a matrix
+    # that is 4× smaller → HPSS, chroma, and all spectral features are
+    # proportionally faster.
+    S_full    = np.abs(librosa.stft(y, n_fft=N_FFT, hop_length=HOP_LENGTH))
+    H_full, _ = librosa.decompose.hpss(S_full, kernel_size=15)  # kernel 31→15: ~4× faster
+    freqs     = librosa.fft_frequencies(sr=sr, n_fft=N_FFT)
     zcr_full  = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
-    freqs     = librosa.fft_frequencies(sr=sr, n_fft=(S_full.shape[0] - 1) * 2)
+
+    # Spectral features — one call each on S_full, result is (1, n_frames); keep [0]
+    centroid_f  = librosa.feature.spectral_centroid( S=S_full, sr=sr)[0]
+    bandwidth_f = librosa.feature.spectral_bandwidth(S=S_full, sr=sr)[0]
+    rolloff_f   = librosa.feature.spectral_rolloff(  S=S_full, sr=sr)[0]
+    flatness_f  = librosa.feature.spectral_flatness( S=S_full       )[0]
+
+    # Warmth per frame: mean of 200–800 Hz bins relative to overall mean
+    low_mid_mask = (freqs >= 200) & (freqs <= 800)
+    eps          = 1e-10
+    warmth_f     = S_full[low_mid_mask].mean(axis=0) / (S_full.mean(axis=0) + eps)
+
+    # Harmonic ratio per frame: harmonic power / total power (Parseval-equivalent)
+    harm_f = (H_full ** 2).mean(axis=0) / ((S_full ** 2).mean(axis=0) + eps)
+
+    # Onset envelope via mel spectrogram derived from S_full (avoids a second STFT)
+    S_mel     = librosa.feature.melspectrogram(S=S_full ** 2, sr=sr, n_fft=N_FFT)
+    onset_env = librosa.onset.onset_strength(S=S_mel, sr=sr)
 
     # ── Global song-level properties ──────────────────────────────────────
     tempo_val, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH)
@@ -443,21 +452,40 @@ def process_song(
 
     # ── Build segment timeline and analyse each segment ───────────────────
     timeline = build_timeline(lyric_entries, audio_duration_ms)
+    n_frames = S_full.shape[1]
 
     mus_entries: list[SubtitleEntry] = []
     for entry in timeline:
         start_sample = ms_to_sample(entry.start_ms, sr, len(y))
         end_sample   = ms_to_sample(entry.end_ms,   sr, len(y))
-        f0 = start_sample // HOP_LENGTH
-        f1 = end_sample   // HOP_LENGTH
+        f0 = min(start_sample // HOP_LENGTH, n_frames)
+        f1 = min(end_sample   // HOP_LENGTH, n_frames)
+
+        # Reduce each per-frame array to a scalar mean over [f0, f1)
+        def _mean(a: np.ndarray) -> float:
+            return float(a[f0:f1].mean()) if f0 < f1 else 0.0
+
+        onset_seg        = onset_env[f0:f1]
+        onset_mean       = float(onset_seg.mean()) if onset_seg.size else 0.0
+        onset_peak_ratio = float(onset_seg.max())  / (onset_mean + eps) if onset_seg.size else 0.0
+
+        # Peak frequency: argmax of mean magnitude across frames (DC bin zeroed)
+        mean_mag    = S_full[:, f0:f1].mean(axis=1).copy() if f0 < f1 else np.zeros(S_full.shape[0])
+        mean_mag[0] = 0.0
+        peak_freq   = float(freqs[np.argmax(mean_mag)])
+
         seg_desc = analyze_segment(
             y[start_sample:end_sample],
-            S_full[:, f0:f1],
-            H_full[:, f0:f1],
-            zcr_full[f0:f1],
-            onset_env[f0:f1],
-            freqs,
-            sr,
+            zcr          = _mean(zcr_full),
+            onset_mean   = onset_mean,
+            onset_peak_ratio = onset_peak_ratio,
+            centroid     = _mean(centroid_f),
+            bandwidth    = _mean(bandwidth_f),
+            rolloff      = _mean(rolloff_f),
+            flatness     = _mean(flatness_f),
+            warmth_ratio = _mean(warmth_f),
+            harm_ratio   = _mean(harm_f),
+            peak_freq    = peak_freq,
         )
         sound_desc = f"{tempo_token}, {seg_desc}"
         mus_entries.append(SubtitleEntry(entry.start_ms, entry.end_ms, sound_desc))
