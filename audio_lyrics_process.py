@@ -369,62 +369,33 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     return ", ".join(parts) if parts else "uncharacterized"
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# ── Per-song processing ───────────────────────────────────────────────────────
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Generate acoustic fingerprint and lyrics files from an audio file and its LRC lyrics.\n"
-            "\n"
-            "Produces TWO output files per song:\n"
-            "  <stem>.fp.txt   — acoustic fingerprint (for sound-similarity index)\n"
-            "  <stem>.lrc.txt  — plain lyrics companion (for lyric-similarity index)\n"
-            "\n"
-            "Both files share the same NOTE header (Artist/Title/Album/Tempo/Key/Mode)\n"
-            "so that song-level context is available in both indexes.\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("input_audio",  help="Input audio file (.mp3, .flac, etc.)")
-    parser.add_argument("input_lyrics", help="Input lyric file (.lrc)")
-    parser.add_argument(
-        "output_dir",
-        help=(
-            "Output directory. "
-            "E.g. 'out/' with input 'some-song.flac' produces "
-            "'out/some-song.mus.txt' and 'out/some-song.lrc.txt'."
-        ),
-    )
-    parser.add_argument(
-        "-n", "--no-ts", action="store_true",
-        help="Omit timestamps from the .fp.txt output",
-    )
-    return parser.parse_args()
+# Audio formats recognised when scanning an input directory
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac", ".opus", ".aiff"}
 
 
-def main() -> int:
-    args = parse_args()
+def process_song(
+    audio_path: Path,
+    lyrics_path: Path | None,
+    output_dir: Path,
+    no_ts: bool,
+) -> None:
+    """Process one audio file and write <stem>.mus.txt and <stem>.lrc.txt to output_dir.
 
-    audio_path  = Path(args.input_audio)
-    lyrics_path = Path(args.input_lyrics)
-    output_dir  = Path(args.output_dir)
-    mus_path    = output_dir / audio_path.with_suffix(".mus.txt").name
-    lrc_path    = output_dir / audio_path.with_suffix(".lrc.txt").name
+    If lyrics_path is None (no matching .lrc found), lyric_entries will be empty
+    and the .lrc.txt will contain only the NOTE header plus 'instrumental'.
+    """
+    mus_path = output_dir / audio_path.with_suffix(".mus.txt").name
+    lrc_path = output_dir / audio_path.with_suffix(".lrc.txt").name
 
-    if not audio_path.exists():
-        print(f"Error: audio file not found: {audio_path}")
-        return 1
-    if not lyrics_path.exists():
-        print(f"Error: lyrics file not found: {lyrics_path}")
-        return 1
-
-    if lyrics_path.suffix.lower() != ".lrc":
-        print(f"Error: unsupported lyrics format '{lyrics_path.suffix}' (expected .lrc)")
-        return 1
-
-    lyrics_text   = lyrics_path.read_text(encoding="utf-8")
-    lyric_entries = parse_lrc(lyrics_text)
-    meta          = parse_lrc_meta(lyrics_text) or None
+    if lyrics_path is not None:
+        lyrics_text   = lyrics_path.read_text(encoding="utf-8")
+        lyric_entries = parse_lrc(lyrics_text)
+        meta          = parse_lrc_meta(lyrics_text) or None
+    else:
+        lyric_entries = []
+        meta          = None
 
     # ── Load audio and compute global song-level properties ───────────────
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
@@ -451,28 +422,85 @@ def main() -> int:
     # ── Build segment timeline and analyse each segment ───────────────────
     timeline = build_timeline(lyric_entries, audio_duration_ms)
 
-    fp_entries: list[SubtitleEntry] = []
+    mus_entries: list[SubtitleEntry] = []
     for entry in timeline:
         start_sample = ms_to_sample(entry.start_ms, sr, len(y))
         end_sample   = ms_to_sample(entry.end_ms,   sr, len(y))
         segment      = y[start_sample:end_sample]
         sound_desc   = f"{tempo_token}, {analyze_segment(segment, sr)}"
-        fp_entries.append(SubtitleEntry(entry.start_ms, entry.end_ms, sound_desc))
+        mus_entries.append(SubtitleEntry(entry.start_ms, entry.end_ms, sound_desc))
 
-    # ── Write .fp.txt ─────────────────────────────────────────────────────
-    mus_path.parent.mkdir(parents=True, exist_ok=True)
+    # ── Write outputs ─────────────────────────────────────────────────────
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     mus_path.write_text(
-        write_fp_output(fp_entries, no_ts=args.no_ts, meta=meta, global_tokens=global_tokens),
+        write_fp_output(mus_entries, no_ts=no_ts, meta=meta, global_tokens=global_tokens),
         encoding="utf-8",
     )
-    print(f"Wrote acoustic fingerprint : {mus_path}")
+    print(f"  {mus_path}")
 
-    # ── Write .lrc.txt ────────────────────────────────────────────────────
     lrc_path.write_text(
         write_lyrics_output(lyric_entries, meta=meta, global_tokens=global_tokens),
         encoding="utf-8",
     )
-    print(f"Wrote lyrics companion     : {lrc_path}")
+    print(f"  {lrc_path}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate acoustic fingerprint and lyrics files for a directory of songs.\n"
+            "\n"
+            "Scans input_dir for audio files and matches each with a same-stem .lrc file.\n"
+            "Produces TWO output files per song:\n"
+            "  <stem>.mus.txt  — acoustic fingerprint (for sound-similarity index)\n"
+            "  <stem>.lrc.txt  — plain lyrics companion (for lyric-similarity index)\n"
+            "\n"
+            f"Recognised audio formats: {', '.join(sorted(AUDIO_EXTENSIONS))}\n"
+            "Songs without a matching .lrc get a .lrc.txt with the NOTE header only.\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("input_dir",  help="Directory containing audio + .lrc pairs")
+    parser.add_argument("output_dir", help="Directory where output files will be written")
+    parser.add_argument(
+        "-n", "--no-ts", action="store_true",
+        help="Omit timestamps from the .mus.txt output",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    input_dir  = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+
+    if not input_dir.is_dir():
+        print(f"Error: input directory not found: {input_dir}")
+        return 1
+
+    audio_files = sorted(
+        p for p in input_dir.iterdir()
+        if p.suffix.lower() in AUDIO_EXTENSIONS
+    )
+
+    if not audio_files:
+        print(f"Error: no audio files found in {input_dir}")
+        return 1
+
+    print(f"Processing {len(audio_files)} song(s) → {output_dir}")
+
+    for audio_path in audio_files:
+        lyrics_path = audio_path.with_suffix(".lrc")
+        if not lyrics_path.exists():
+            print(f"[{audio_path.name}] (no .lrc found — instrumental)")
+            lyrics_path = None
+        else:
+            print(f"[{audio_path.name}]")
+        process_song(audio_path, lyrics_path, output_dir, no_ts=args.no_ts)
 
     return 0
 
