@@ -5,17 +5,17 @@ script_dir="$(dirname "$(realpath "$0")")"
 # Create fingerprints for every given audio file in the given directory (non-recursively), or single file if a file is given
 
 function fingerprint_file() {
-    audio_file="$1"
-    base_audio_name="$(basename "$audio_file")"
-    lyrics_file="${audio_file%.*}.lrc"
-    fingerprint_file="${audio_file%.*}.fp.txt"
+    local audio_file="$1"
+    local base_audio_name="$(basename "$audio_file")"
+    local lyrics_file="${audio_file%.*}.lrc"
+    local fingerprint_stem="${audio_file%.*}"
     echo "Processing: '$base_audio_name'..."
     
     echo "Downloading lyrics for '$base_audio_name'..."
     $script_dir/download_lyrics.sh "$audio_file" "$lyrics_file"
 
-    echo "Generating fingerprint for '$base_audio_name'..."
-    python $script_dir/singing_srt_audio_merge.py "$audio_file" "$lyrics_file" "$fingerprint_file" --no-ts
+    echo "Generating fingerprint for '$base_audio_name', stem: '$fingerprint_stem'..."
+    python $script_dir/singing_srt_audio_merge.py "$audio_file" "$lyrics_file" "$fingerprint_stem" --no-ts
 }
 
 target="$1"
@@ -40,7 +40,15 @@ if [ -f "$target" ]; then
 fi
 
 # If target is a directory, process all audio files in it (non-recursively)
-find "$target" -maxdepth 1 -type f \( -iname "*.mp3" -o -iname "*.flac" -o -iname "*.wav" \) | while read -r audio_file; do
+audio_files=$(find "$target" -maxdepth 1 -type f \( -iname "*.mp3" -o -iname "*.flac" -o -iname "*.wav" \))
+counter=1
+total=$(echo "$audio_files" | wc -l)
+
+echo "Found $total audio files in directory '$target'."
+
+echo "$audio_files" | while read -r audio_file; do
+    echo "Processing file $counter of $total: '$audio_file'"
     fingerprint_file "$audio_file"
+    counter=$((counter + 1))
 done
 
