@@ -185,6 +185,7 @@ def ms_to_sample(ms: int, sr: int, total_samples: int) -> int:
 
 
 SUBWINDOW_MS = 4000
+HOP_LENGTH   = 512   # STFT hop; all frame-aligned features share this value
 
 
 def build_timeline(
@@ -249,9 +250,13 @@ _MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
                             2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
 
-def detect_key_and_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
-    """Detect dominant key and mode (major/minor) via Krumhansl-Schmuckler profiles."""
-    mean_chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+def detect_key_and_mode(S: np.ndarray, sr: int) -> tuple[str, str]:
+    """Detect dominant key and mode (major/minor) via Krumhansl-Schmuckler profiles.
+
+    Accepts the precomputed magnitude STFT S to avoid recomputing it.
+    Uses chroma_stft (reuses S) instead of chroma_cqt (separate expensive CQT).
+    """
+    mean_chroma = librosa.feature.chroma_stft(S=S, sr=sr).mean(axis=1)
     _, best_root, best_mode = max(
         (float(np.dot(np.roll(profile, root), mean_chroma)), root, mode)
         for root in range(12)
@@ -266,8 +271,19 @@ def safe_mean(arr: np.ndarray) -> float:
     return float(np.mean(arr)) if arr.size else 0.0
 
 
-def analyze_segment(y: np.ndarray, sr: int) -> str:
+def analyze_segment(
+    y: np.ndarray,         # time-domain slice — silence check + RMS only
+    S: np.ndarray,         # magnitude STFT slice  [n_bins, n_frames]
+    H: np.ndarray,         # harmonic magnitude STFT slice  [n_bins, n_frames]
+    zcr_frames: np.ndarray,# ZCR frame slice  [n_frames]
+    onset_env: np.ndarray, # onset envelope slice  [n_frames]
+    freqs: np.ndarray,     # frequency bin centres  [n_bins]  — constant across segments
+    sr: int,
+) -> str:
     """Return a musician-style natural-language description for a single audio segment.
+
+    All heavy arrays (S, H, zcr_frames, onset_env) are precomputed globally in
+    process_song and sliced to this segment's frame range before calling here.
 
     Features and their descriptors:
       - RMS energy          → explosive / loud / moderate / soft
@@ -284,31 +300,27 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
 
     eps = 1e-10
 
-    rms      = float(np.sqrt(np.mean(y ** 2) + eps))
-    zcr      = safe_mean(librosa.feature.zero_crossing_rate(y))
+    rms = float(np.sqrt(np.mean(y ** 2) + eps))
+    zcr = safe_mean(zcr_frames)
 
-    S         = np.abs(librosa.stft(y))
     centroid  = safe_mean(librosa.feature.spectral_centroid(S=S, sr=sr))
     bandwidth = safe_mean(librosa.feature.spectral_bandwidth(S=S, sr=sr))
     rolloff   = safe_mean(librosa.feature.spectral_rolloff(S=S, sr=sr))
     flatness  = safe_mean(librosa.feature.spectral_flatness(S=S))
 
-    onset_env        = librosa.onset.onset_strength(y=y, sr=sr)
     onset_mean       = safe_mean(onset_env)
     onset_peak_ratio = (float(onset_env.max()) if onset_env.size else 0.0) / (onset_mean + eps)
 
-    mean_mag    = S.mean(axis=1)
-    mean_mag[0] = 0.0
-    freqs       = librosa.fft_frequencies(sr=sr, n_fft=(S.shape[0] - 1) * 2)
+    mean_mag    = S.mean(axis=1).copy()
+    mean_mag[0] = 0.0   # zero DC bin — not musically meaningful
     peak_freq   = float(freqs[np.argmax(mean_mag)])
 
-    # Warmth: 200–800 Hz band energy relative to overall mean (reuses S and freqs)
+    # Warmth: 200–800 Hz band energy relative to overall mean
     low_mid_mask = (freqs >= 200) & (freqs <= 800)
     warmth_ratio = float(S[low_mid_mask].mean()) / (float(S.mean()) + eps)
 
-    y_harm, _   = librosa.effects.hpss(y)
-    total_power = float(np.mean(y ** 2)) + eps
-    harm_ratio  = float(np.mean(y_harm ** 2)) / total_power
+    # Harmonic ratio from precomputed HPSS — equivalent to time-domain ratio by Parseval
+    harm_ratio = float(np.mean(H ** 2)) / (float(np.mean(S ** 2)) + eps)
 
     parts: list[str] = []
 
@@ -397,12 +409,22 @@ def process_song(
         lyric_entries = []
         meta          = None
 
-    # ── Load audio and compute global song-level properties ───────────────
+    # ── Load audio ────────────────────────────────────────────────────────
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
     sr = int(sr)
     audio_duration_ms = int(len(y) * 1000 / sr)
 
-    tempo_val, _ = librosa.beat.beat_track(y=y, sr=sr)
+    # ── Precompute all expensive features once from the full audio ────────
+    # Every per-segment call previously recomputed STFT, HPSS, onset, and ZCR.
+    # Here we compute each once and slice by frame range inside the loop.
+    S_full    = np.abs(librosa.stft(y, hop_length=HOP_LENGTH))
+    H_full, _ = librosa.decompose.hpss(S_full)
+    zcr_full  = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
+    freqs     = librosa.fft_frequencies(sr=sr, n_fft=(S_full.shape[0] - 1) * 2)
+
+    # ── Global song-level properties ──────────────────────────────────────
+    tempo_val, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH)
     bpm = float(np.atleast_1d(tempo_val)[0])
     if bpm < 90:
         tempo_token = "slow tempo"
@@ -411,7 +433,7 @@ def process_song(
     else:
         tempo_token = "fast tempo"
 
-    key_name, mode_name = detect_key_and_mode(y, sr)
+    key_name, mode_name = detect_key_and_mode(S_full, sr)
 
     global_tokens: dict[str, str] = {
         "Tempo": tempo_token,
@@ -426,8 +448,18 @@ def process_song(
     for entry in timeline:
         start_sample = ms_to_sample(entry.start_ms, sr, len(y))
         end_sample   = ms_to_sample(entry.end_ms,   sr, len(y))
-        segment      = y[start_sample:end_sample]
-        sound_desc   = f"{tempo_token}, {analyze_segment(segment, sr)}"
+        f0 = start_sample // HOP_LENGTH
+        f1 = end_sample   // HOP_LENGTH
+        seg_desc = analyze_segment(
+            y[start_sample:end_sample],
+            S_full[:, f0:f1],
+            H_full[:, f0:f1],
+            zcr_full[f0:f1],
+            onset_env[f0:f1],
+            freqs,
+            sr,
+        )
+        sound_desc = f"{tempo_token}, {seg_desc}"
         mus_entries.append(SubtitleEntry(entry.start_ms, entry.end_ms, sound_desc))
 
     # ── Write outputs ─────────────────────────────────────────────────────
