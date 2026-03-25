@@ -25,20 +25,8 @@ class SubtitleEntry:
 
 # ── Timestamp / subtitle parsers ──────────────────────────────────────────────
 
-TIME_RE = re.compile(
-    r"(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})"
-)
 LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})\.(\d{2})\]")
 LRC_META_RE = re.compile(r"\[(\w+):(.+)\]")
-
-
-def parse_timestamp_to_ms(h: str, m: str, s: str, ms: str) -> int:
-    return (
-        int(h) * 3600 * 1000
-        + int(m) * 60 * 1000
-        + int(s) * 1000
-        + int(ms)
-    )
 
 
 def format_ms_to_timestamp(ms: int) -> str:
@@ -50,33 +38,6 @@ def format_ms_to_timestamp(ms: int) -> str:
     s = ms // 1000
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def parse_srt(srt_text: str) -> List[SubtitleEntry]:
-    blocks = re.split(r"\n\s*\n", srt_text.strip(), flags=re.MULTILINE)
-    entries: List[SubtitleEntry] = []
-    for block in blocks:
-        lines = [line.rstrip("\n\r") for line in block.splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-        try:
-            index = int(lines[0].strip())
-            time_line = lines[1].strip()
-            text = "\n".join(lines[2:]).strip()
-        except ValueError:
-            index = len(entries) + 1
-            time_line = lines[0].strip()
-            text = "\n".join(lines[1:]).strip()
-        match = TIME_RE.match(time_line)
-        if not match:
-            raise ValueError(f"Invalid SRT time line: {time_line}")
-        start_ms = parse_timestamp_to_ms(*match.groups()[0:4])
-        end_ms   = parse_timestamp_to_ms(*match.groups()[4:8])
-        if end_ms <= start_ms:
-            continue
-        entries.append(SubtitleEntry(index=index, start_ms=start_ms, end_ms=end_ms, text=text))
-    entries.sort(key=lambda e: (e.start_ms, e.end_ms))
-    return entries
 
 
 def parse_lrc_meta(lrc_text: str) -> dict[str, str]:
@@ -338,15 +299,19 @@ def detect_key_and_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
             best_key   = root
             best_mode  = "minor"
 
-    return f"key:{_KEY_NAMES[best_key]}", f"mode:{best_mode}"
+    return _KEY_NAMES[best_key], best_mode  # e.g. ("A", "major")
 
 
 # ── Segment-level acoustic analysis ──────────────────────────────────────────
 
 def analyze_segment(y: np.ndarray, sr: int) -> str:
-    """Return acoustic syllable tokens for a single audio segment."""
+    """Return a natural-language acoustic description for a single audio segment.
+
+    Each feature maps to a short phrase that embeds well for RAG queries.
+    Phrases are space-joined; each branch emits a distinct string so no dedup needed.
+    """
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-5:
-        return "shhh"
+        return "silence"
 
     eps = 1e-10
 
@@ -372,70 +337,56 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     total_power = float(np.mean(y ** 2)) + eps
     harm_ratio  = float(np.mean(y_harm ** 2)) / total_power
 
-    syllables: List[str] = []
+    parts: List[str] = []
 
     # Energy — 4 tiers
     if rms > 0.20:
-        syllables.append("DOOM")
+        parts.append("very loud intense")
     elif rms > 0.10:
-        syllables.append("voom")
+        parts.append("loud energetic")
     elif rms > 0.04:
-        syllables.append("meh")
+        parts.append("moderate energy")
     else:
-        syllables.append("hmm")
+        parts.append("quiet low energy")
 
-    # Spectral centroid
+    # Spectral centroid (brightness)
     if centroid > 3200:
-        syllables.append("tsee")
+        parts.append("bright treble-heavy")
     elif centroid > 1800:
-        syllables.append("tsing")
+        parts.append("upper midrange bright")
     else:
-        syllables.append("bwoom")
+        parts.append("dark bass-heavy")
 
     # Tonal character
     if flatness > 0.25 or zcr > 0.18:
-        syllables.append("bzzra")
+        parts.append("noisy distorted")
     elif bandwidth < 1200 and flatness < 0.12:
-        syllables.append("ooh")
+        parts.append("clean pure tone")
 
     # Harmonic vs. percussive
     if harm_ratio > 0.70:
-        syllables.append("tonal")
+        parts.append("melodic harmonic")
     elif harm_ratio < 0.30:
-        syllables.append("noisy")
+        parts.append("percussive noisy")
 
     # Rhythmic attacks
     if onset_mean > 8.0 or (onset_mean > 3.0 and onset_peak_ratio > 5.0):
-        syllables.append("tak-tak")
+        parts.append("strong rhythmic beat")
     else:
-        syllables.append("ahhh")
+        parts.append("smooth sustained")
 
     # Spectral spread / brightness
     if bandwidth > 2200 or rolloff > 5500:
-        syllables.append("shaa")
+        parts.append("wide frequency spread")
 
     # Peak frequency
     if peak_freq > 550:
-        syllables.append("weee")
+        parts.append("high-pitched dominant")
     elif 0 < peak_freq < 180:
-        syllables.append("dum")
+        parts.append("deep bass dominant")
 
-    seen:  set[str]  = set()
-    final: List[str] = []
-    for s in syllables:
-        if s not in seen:
-            seen.add(s)
-            final.append(s)
+    return ", ".join(parts) if parts else "uncharacterized"
 
-    return " ".join(final) if final else "mmm"
-
-
-def combine_text(lyric_text: str, sound_text: str) -> str:
-    lyric_text = lyric_text.strip()
-    sound_text = sound_text.strip()
-    if lyric_text:
-        return f"{lyric_text} {{{sound_text}}}"
-    return f"{{{sound_text}}}"
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -455,7 +406,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("input_audio",  help="Input audio file (.mp3, .flac, etc.)")
-    parser.add_argument("input_lyrics", help="Input lyric file (.srt or .lrc)")
+    parser.add_argument("input_lyrics", help="Input lyric file (.lrc)")
     parser.add_argument(
         "output_stem",
         help=(
@@ -488,19 +439,13 @@ def main() -> int:
         print(f"Error: lyrics file not found: {lyrics_path}")
         return 1
 
-    suffix = lyrics_path.suffix.lower()
-    if suffix not in (".srt", ".lrc"):
-        print(f"Error: unsupported lyrics format '{suffix}' (expected .srt or .lrc)")
+    if lyrics_path.suffix.lower() != ".lrc":
+        print(f"Error: unsupported lyrics format '{lyrics_path.suffix}' (expected .lrc)")
         return 1
 
     lyrics_text = lyrics_path.read_text(encoding="utf-8")
-
-    if suffix == ".srt":
-        lyric_entries = parse_srt(lyrics_text)
-        meta = None
-    else:
-        lyric_entries = parse_lrc(lyrics_text)
-        meta = parse_lrc_meta(lyrics_text) or None
+    lyric_entries = parse_lrc(lyrics_text)
+    meta = parse_lrc_meta(lyrics_text) or None
 
     # ── Load audio and compute global song-level properties ───────────────
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
@@ -510,18 +455,18 @@ def main() -> int:
     tempo_val, _ = librosa.beat.beat_track(y=y, sr=sr)
     bpm = float(np.atleast_1d(tempo_val)[0])
     if bpm < 90:
-        tempo_token = "bpm:slow"
+        tempo_token = "slow tempo"
     elif bpm < 130:
-        tempo_token = "bpm:mid"
+        tempo_token = "mid tempo"
     else:
-        tempo_token = "bpm:fast"
+        tempo_token = "fast tempo"
 
-    key_token, mode_token = detect_key_and_mode(y, sr)
+    key_name, mode_name = detect_key_and_mode(y, sr)
 
     global_tokens: dict[str, str] = {
         "Tempo": tempo_token,
-        "Key":   key_token,
-        "Mode":  mode_token,
+        "Key":   key_name,
+        "Mode":  mode_name,
     }
 
     # ── Build segment timeline and analyse each segment ───────────────────
@@ -534,14 +479,13 @@ def main() -> int:
         end_sample   = ms_to_sample(entry.end_ms,   sr, len(y))
         segment      = y[start_sample:end_sample]
 
-        sound_desc  = f"{tempo_token} {analyze_segment(segment, sr)}"
-        merged_text = combine_text(entry.text, sound_desc)
+        sound_desc = f"{tempo_token}, {analyze_segment(segment, sr)}"
 
         fp_entries.append(SubtitleEntry(
             index=0,
             start_ms=entry.start_ms,
             end_ms=entry.end_ms,
-            text=merged_text,
+            text=sound_desc,
         ))
 
     # ── Write .fp.txt ─────────────────────────────────────────────────────
