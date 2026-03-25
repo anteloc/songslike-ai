@@ -305,10 +305,17 @@ def detect_key_and_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
 # ── Segment-level acoustic analysis ──────────────────────────────────────────
 
 def analyze_segment(y: np.ndarray, sr: int) -> str:
-    """Return a natural-language acoustic description for a single audio segment.
+    """Return a musician-style natural-language description for a single audio segment.
 
-    Each feature maps to a short phrase that embeds well for RAG queries.
-    Phrases are space-joined; each branch emits a distinct string so no dedup needed.
+    Features and their descriptors:
+      - RMS energy          → explosive / loud / moderate / soft
+      - Spectral centroid   → crisp / bright / dark
+      - Warmth (200–800 Hz) → warm  (conditional — emitted only when prominent)
+      - Flatness + ZCR      → gritty / clean  (conditional)
+      - Harmonic ratio      → melodic / percussive  (conditional)
+      - Onset density       → dense driving / punchy / sparse / smooth
+      - Spectral spread     → full  (conditional)
+      - Peak frequency      → airy / bassy  (conditional)
     """
     if y.size == 0 or float(np.max(np.abs(y))) < 1e-5:
         return "silence"
@@ -333,6 +340,10 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     freqs       = librosa.fft_frequencies(sr=sr, n_fft=(S.shape[0] - 1) * 2)
     peak_freq   = float(freqs[np.argmax(mean_mag)])
 
+    # Warmth: 200–800 Hz band energy relative to overall mean (reuses S and freqs)
+    low_mid_mask = (freqs >= 200) & (freqs <= 800)
+    warmth_ratio = float(S[low_mid_mask].mean()) / (float(S.mean()) + eps)
+
     y_harm, _   = librosa.effects.hpss(y)
     total_power = float(np.mean(y ** 2)) + eps
     harm_ratio  = float(np.mean(y_harm ** 2)) / total_power
@@ -341,49 +352,57 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
 
     # Energy — 4 tiers
     if rms > 0.20:
-        parts.append("very loud intense")
+        parts.append("explosive")
     elif rms > 0.10:
-        parts.append("loud energetic")
+        parts.append("loud")
     elif rms > 0.04:
-        parts.append("moderate energy")
+        parts.append("moderate")
     else:
-        parts.append("quiet low energy")
+        parts.append("soft")
 
-    # Spectral centroid (brightness)
+    # Spectral centroid (overall brightness)
     if centroid > 3200:
-        parts.append("bright treble-heavy")
+        parts.append("crisp")
     elif centroid > 1800:
-        parts.append("upper midrange bright")
+        parts.append("bright")
     else:
-        parts.append("dark bass-heavy")
+        parts.append("dark")
 
-    # Tonal character
+    # Warmth: low-mid body — orthogonal to brightness, e.g. a cello is dark AND warm
+    if warmth_ratio > 1.2:
+        parts.append("warm")
+
+    # Tonal character (noise / distortion)
     if flatness > 0.25 or zcr > 0.18:
-        parts.append("noisy distorted")
+        parts.append("gritty")
     elif bandwidth < 1200 and flatness < 0.12:
-        parts.append("clean pure tone")
+        parts.append("clean")
 
-    # Harmonic vs. percussive
+    # Harmonic vs. percussive — orthogonal to gritty/clean, e.g. a distorted lead is melodic AND gritty
     if harm_ratio > 0.70:
-        parts.append("melodic harmonic")
+        parts.append("melodic")
     elif harm_ratio < 0.30:
-        parts.append("percussive noisy")
+        parts.append("percussive")
 
-    # Rhythmic attacks
-    if onset_mean > 8.0 or (onset_mean > 3.0 and onset_peak_ratio > 5.0):
-        parts.append("strong rhythmic beat")
+    # Rhythmic character + onset density (combined: onset_mean captures both)
+    if onset_mean > 8.0:
+        parts.append("dense driving")
+    elif onset_mean > 3.0 and onset_peak_ratio > 5.0:
+        parts.append("punchy")
+    elif onset_mean < 1.5:
+        parts.append("sparse")
     else:
-        parts.append("smooth sustained")
+        parts.append("smooth")
 
-    # Spectral spread / brightness
+    # Spectral spread
     if bandwidth > 2200 or rolloff > 5500:
-        parts.append("wide frequency spread")
+        parts.append("full")
 
     # Peak frequency
     if peak_freq > 550:
-        parts.append("high-pitched dominant")
+        parts.append("airy")
     elif 0 < peak_freq < 180:
-        parts.append("deep bass dominant")
+        parts.append("bassy")
 
     return ", ".join(parts) if parts else "uncharacterized"
 
