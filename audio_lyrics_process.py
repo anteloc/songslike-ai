@@ -7,7 +7,6 @@ import re
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import numpy as np
 import librosa
@@ -17,27 +16,15 @@ import librosa
 
 @dataclass
 class SubtitleEntry:
-    index: int
     start_ms: int
     end_ms: int
     text: str
 
 
-# ── Timestamp / subtitle parsers ──────────────────────────────────────────────
+# ── LRC parsers ───────────────────────────────────────────────────────────────
 
 LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{2})\.(\d{2})\]")
 LRC_META_RE = re.compile(r"\[(\w+):(.+)\]")
-
-
-def format_ms_to_timestamp(ms: int) -> str:
-    ms = max(0, ms)
-    h = ms // 3600000
-    ms %= 3600000
-    m = ms // 60000
-    ms %= 60000
-    s = ms // 1000
-    ms %= 1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
 def parse_lrc_meta(lrc_text: str) -> dict[str, str]:
@@ -45,32 +32,33 @@ def parse_lrc_meta(lrc_text: str) -> dict[str, str]:
     meta: dict[str, str] = {}
     for line in lrc_text.splitlines():
         match = LRC_META_RE.match(line.strip())
-        if match and not LRC_TIME_RE.match(line.strip()):
+        if match:
             key, value = match.group(1).lower(), match.group(2).strip()
             if key in tag_map:
                 meta[tag_map[key]] = value
     return meta
 
 
-def parse_lrc(lrc_text: str) -> List[SubtitleEntry]:
-    timed: List[tuple[int, str]] = []
+def parse_lrc(lrc_text: str) -> list[SubtitleEntry]:
+    timed: list[tuple[int, str]] = []
     for line in lrc_text.splitlines():
         line = line.strip()
-        match = LRC_TIME_RE.match(line)
-        if not match:
+        m = LRC_TIME_RE.match(line)
+        if not m:
             continue
-        m, s, cs = match.groups()
-        start_ms = int(m) * 60000 + int(s) * 1000 + int(cs) * 10
-        text = line[match.end():].strip()
+        mins, secs, cs = m.groups()
+        start_ms = int(mins) * 60000 + int(secs) * 1000 + int(cs) * 10
+        text = line[m.end():].strip()
         if text:
             timed.append((start_ms, text))
-    entries: List[SubtitleEntry] = []
-    for i, (start_ms, text) in enumerate(timed):
-        end_ms = timed[i + 1][0] if i + 1 < len(timed) else int(1e9)
-        if end_ms <= start_ms:
-            continue
-        entries.append(SubtitleEntry(index=i + 1, start_ms=start_ms, end_ms=end_ms, text=text))
-    return entries
+
+    # pair each entry with the next's start as end_ms; last entry uses sentinel
+    ends = [t[0] for t in timed[1:]] + [int(1e9)]
+    return [
+        SubtitleEntry(start, end, text)
+        for (start, text), end in zip(timed, ends)
+        if end > start
+    ]
 
 
 # ── Output writers ────────────────────────────────────────────────────────────
@@ -88,40 +76,41 @@ def _build_note_block(
     return "\n".join(note_lines)
 
 
+def format_ms_to_timestamp(ms: int) -> str:
+    ms = max(0, ms)
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
 def write_fp_output(
-    entries: List[SubtitleEntry],
+    entries: list[SubtitleEntry],
     no_ts: bool,
     meta: dict[str, str] | None,
     global_tokens: dict[str, str] | None,
 ) -> str:
     """
-    Write the acoustic fingerprint file (.fp.txt).
+    Build the acoustic fingerprint file content (.fp.txt).
 
-    ┌─────────────────────────────────────────────────────────┐
-    │  FILE FORMAT: <stem>.fp.txt                             │
-    │─────────────────────────────────────────────────────────│
-    │  NOTE                                                   │
-    │  Artist: <artist>                                       │
-    │  Title:  <title>                                        │
-    │  Album:  <album>                                        │
-    │  Tempo:  bpm:fast | bpm:mid | bpm:slow                  │
-    │  Key:    key:A | key:A# | … | key:G#                    │
-    │  Mode:   mode:major | mode:minor                        │
-    │                                                         │
-    │  1                                                      │
-    │  00:00:00,000 --> 00:00:04,000   (omitted with --no-ts) │
-    │  {bpm:fast DOOM tsing ahhh shaa dum}                    │
-    │                                                         │
-    │  2                                                      │
-    │  00:00:04,000 --> 00:00:08,000                          │
-    │  Lyric line text {bpm:fast DOOM tsing ahhh shaa dum}    │
-    │  …                                                      │
-    └─────────────────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  FILE FORMAT: <stem>.fp.txt                                     │
+    │─────────────────────────────────────────────────────────────────│
+    │  NOTE                                                           │
+    │  Artist: <artist>                                               │
+    │  Title:  <title>                                                │
+    │  Album:  <album>                                                │
+    │  Tempo:  slow tempo | mid tempo | fast tempo                    │
+    │  Key:    A | A# | … | G#                                        │
+    │  Mode:   major | minor                                          │
+    │                                                                 │
+    │  1                                                              │
+    │  00:00:00,000 --> 00:00:04,000   (omitted with --no-ts)         │
+    │  fast tempo, loud, crisp, melodic, punchy, full, airy           │
+    │  …                                                              │
+    └─────────────────────────────────────────────────────────────────┘
 
-    Indexed by rag_solution.py as the ACOUSTIC index.
-    The {…} token blocks are the only content read by fp_to_acoustic_prose().
-    Lyric text present on the same line as a token block is ignored by the
-    acoustic indexer — it exists only for human readability.
+    Indexed as the ACOUSTIC index.
     """
     blocks = []
     if meta or global_tokens:
@@ -142,12 +131,12 @@ def write_fp_output(
 
 
 def write_lyrics_output(
-    lyric_entries: List[SubtitleEntry],
+    lyric_entries: list[SubtitleEntry],
     meta: dict[str, str] | None,
     global_tokens: dict[str, str] | None,
 ) -> str:
     """
-    Write the plain-lyrics companion file (.lrc.txt).
+    Build the plain-lyrics companion file content (.lrc.txt).
 
     ┌─────────────────────────────────────────────────────────┐
     │  FILE FORMAT: <stem>.lrc.txt                            │
@@ -156,9 +145,9 @@ def write_lyrics_output(
     │  Artist: <artist>                                       │
     │  Title:  <title>                                        │
     │  Album:  <album>                                        │
-    │  Tempo:  bpm:fast | bpm:mid | bpm:slow                  │
-    │  Key:    key:A | key:A# | … | key:G#                    │
-    │  Mode:   mode:major | mode:minor                        │
+    │  Tempo:  slow tempo | mid tempo | fast tempo            │
+    │  Key:    A | A# | … | G#                                │
+    │  Mode:   major | minor                                  │
     │                                                         │
     │  <lyric line 1>                                         │
     │  <lyric line 2>                                         │
@@ -168,11 +157,9 @@ def write_lyrics_output(
     │  instrumental                                           │
     └─────────────────────────────────────────────────────────┘
 
-    Indexed by rag_solution.py as the LYRIC index.
-    No acoustic token blocks appear here.  The NOTE header (Tempo/Key/Mode)
-    is kept so that even purely lyric-based queries still benefit from the
-    song-level acoustic context when the two indexes are merged.
-    Timestamps are intentionally omitted — only the text matters.
+    Indexed as the LYRIC index. Timestamps are omitted — only the text matters.
+    Duplicate lines (repeated chorus etc.) are deduplicated.
+    The NOTE header is kept so lyric-based queries still see song-level context.
     """
     blocks = []
     if meta or global_tokens:
@@ -191,80 +178,64 @@ def write_lyrics_output(
     return "\n\n".join(blocks) + "\n"
 
 
-# ── Timeline helpers ──────────────────────────────────────────────────────────
-
-def safe_mean(arr: np.ndarray) -> float:
-    return float(np.mean(arr)) if arr.size else 0.0
-
+# ── Timeline ──────────────────────────────────────────────────────────────────
 
 def ms_to_sample(ms: int, sr: int, total_samples: int) -> int:
-    sample = int(ms * sr / 1000)
-    return max(0, min(sample, total_samples))
-
-
-def make_gap_entry(start_ms: int, end_ms: int) -> SubtitleEntry | None:
-    if end_ms <= start_ms:
-        return None
-    return SubtitleEntry(index=0, start_ms=start_ms, end_ms=end_ms, text="")
-
-
-def build_full_timeline_entries(
-    lyric_entries: List[SubtitleEntry],
-    audio_duration_ms: int,
-) -> List[SubtitleEntry]:
-    if not lyric_entries:
-        gap = make_gap_entry(0, audio_duration_ms)
-        return [gap] if gap else []
-
-    result: List[SubtitleEntry] = []
-    intro = make_gap_entry(0, lyric_entries[0].start_ms)
-    if intro:
-        result.append(intro)
-
-    prev_end = lyric_entries[0].end_ms
-    result.append(lyric_entries[0])
-
-    for entry in lyric_entries[1:]:
-        gap = make_gap_entry(prev_end, entry.start_ms)
-        if gap:
-            result.append(gap)
-        result.append(entry)
-        prev_end = max(prev_end, entry.end_ms)
-
-    outro = make_gap_entry(lyric_entries[-1].end_ms, audio_duration_ms)
-    if outro:
-        result.append(outro)
-
-    cleaned: List[SubtitleEntry] = []
-    for entry in result:
-        start_ms = max(0, min(entry.start_ms, audio_duration_ms))
-        end_ms   = max(0, min(entry.end_ms,   audio_duration_ms))
-        if end_ms <= start_ms:
-            continue
-        if cleaned and start_ms < cleaned[-1].end_ms:
-            start_ms = cleaned[-1].end_ms
-        if end_ms <= start_ms:
-            continue
-        cleaned.append(SubtitleEntry(index=0, start_ms=start_ms, end_ms=end_ms, text=entry.text))
-    return cleaned
+    return max(0, min(int(ms * sr / 1000), total_samples))
 
 
 SUBWINDOW_MS = 4000
 
 
-def subdivide_segments(entries: List[SubtitleEntry], max_ms: int) -> List[SubtitleEntry]:
-    result: List[SubtitleEntry] = []
-    for entry in entries:
+def build_timeline(
+    lyric_entries: list[SubtitleEntry],
+    audio_duration_ms: int,
+    max_segment_ms: int = SUBWINDOW_MS,
+) -> list[SubtitleEntry]:
+    """Build a gapless, subdivided analysis timeline from lyric entries.
+
+    Fills intro/inter-lyric/outro gaps with empty-text entries, clamps everything
+    to [0, audio_duration_ms], resolves overlaps, then breaks any segment longer
+    than max_segment_ms into equal sub-windows.
+    """
+    # Build gapless raw timeline
+    raw: list[SubtitleEntry] = []
+    if not lyric_entries:
+        raw.append(SubtitleEntry(0, audio_duration_ms, ""))
+    else:
+        prev_end = 0
+        for entry in lyric_entries:
+            if entry.start_ms > prev_end:
+                raw.append(SubtitleEntry(prev_end, entry.start_ms, ""))
+            raw.append(entry)
+            prev_end = max(prev_end, entry.end_ms)
+        if prev_end < audio_duration_ms:
+            raw.append(SubtitleEntry(prev_end, audio_duration_ms, ""))
+
+    # Clamp to audio bounds and resolve overlaps
+    timeline: list[SubtitleEntry] = []
+    for entry in raw:
+        start = max(0, min(entry.start_ms, audio_duration_ms))
+        end   = max(0, min(entry.end_ms,   audio_duration_ms))
+        if timeline:
+            start = max(start, timeline[-1].end_ms)
+        if end > start:
+            timeline.append(SubtitleEntry(start, end, entry.text))
+
+    # Subdivide long segments into equal sub-windows
+    result: list[SubtitleEntry] = []
+    for entry in timeline:
         duration = entry.end_ms - entry.start_ms
-        if duration <= max_ms:
+        if duration <= max_segment_ms:
             result.append(entry)
             continue
-        n = math.ceil(duration / max_ms)
+        n = math.ceil(duration / max_segment_ms)
         window = duration // n
         for i in range(n):
             start = entry.start_ms + i * window
             end   = entry.start_ms + (i + 1) * window if i < n - 1 else entry.end_ms
-            result.append(SubtitleEntry(index=0, start_ms=start, end_ms=end, text=entry.text))
+            result.append(SubtitleEntry(start, end, entry.text))
+
     return result
 
 
@@ -279,30 +250,21 @@ _MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
 
 
 def detect_key_and_mode(y: np.ndarray, sr: int) -> tuple[str, str]:
-    """Detect dominant key and mode (major/minor) from the full audio."""
-    chroma     = librosa.feature.chroma_cqt(y=y, sr=sr)
-    mean_chroma = chroma.mean(axis=1)
-
-    best_key   = 0
-    best_mode  = "major"
-    best_score = -np.inf
-
-    for root in range(12):
-        major_score = float(np.dot(np.roll(_MAJOR_PROFILE, root), mean_chroma))
-        minor_score = float(np.dot(np.roll(_MINOR_PROFILE, root), mean_chroma))
-        if major_score > best_score:
-            best_score = major_score
-            best_key   = root
-            best_mode  = "major"
-        if minor_score > best_score:
-            best_score = minor_score
-            best_key   = root
-            best_mode  = "minor"
-
-    return _KEY_NAMES[best_key], best_mode  # e.g. ("A", "major")
+    """Detect dominant key and mode (major/minor) via Krumhansl-Schmuckler profiles."""
+    mean_chroma = librosa.feature.chroma_cqt(y=y, sr=sr).mean(axis=1)
+    _, best_root, best_mode = max(
+        (float(np.dot(np.roll(profile, root), mean_chroma)), root, mode)
+        for root in range(12)
+        for profile, mode in [(_MAJOR_PROFILE, "major"), (_MINOR_PROFILE, "minor")]
+    )
+    return _KEY_NAMES[best_root], best_mode
 
 
 # ── Segment-level acoustic analysis ──────────────────────────────────────────
+
+def safe_mean(arr: np.ndarray) -> float:
+    return float(np.mean(arr)) if arr.size else 0.0
+
 
 def analyze_segment(y: np.ndarray, sr: int) -> str:
     """Return a musician-style natural-language description for a single audio segment.
@@ -348,7 +310,7 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     total_power = float(np.mean(y ** 2)) + eps
     harm_ratio  = float(np.mean(y_harm ** 2)) / total_power
 
-    parts: List[str] = []
+    parts: list[str] = []
 
     # Energy — 4 tiers
     if rms > 0.20:
@@ -407,13 +369,12 @@ def analyze_segment(y: np.ndarray, sr: int) -> str:
     return ", ".join(parts) if parts else "uncharacterized"
 
 
-
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Merge lyric subtitles with acoustic syllable tokens.\n"
+            "Generate acoustic fingerprint and lyrics files from an audio file and its LRC lyrics.\n"
             "\n"
             "Produces TWO output files per song:\n"
             "  <stem>.fp.txt   — acoustic fingerprint (for sound-similarity index)\n"
@@ -427,12 +388,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input_audio",  help="Input audio file (.mp3, .flac, etc.)")
     parser.add_argument("input_lyrics", help="Input lyric file (.lrc)")
     parser.add_argument(
-        "output_stem",
+        "output_dir",
         help=(
-            "Output path stem WITHOUT extension. "
-            "E.g. 'out/104.AC_DC-Thunderstruck' produces "
-            "'out/104.AC_DC-Thunderstruck.fp.txt' and "
-            "'out/104.AC_DC-Thunderstruck.lrc.txt'."
+            "Output directory. "
+            "E.g. 'out/' with input 'some-song.flac' produces "
+            "'out/some-song.mus.txt' and 'out/some-song.lrc.txt'."
         ),
     )
     parser.add_argument(
@@ -445,11 +405,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    audio_path = Path(args.input_audio)
+    audio_path  = Path(args.input_audio)
     lyrics_path = Path(args.input_lyrics)
-    stem        = Path(args.output_stem)
-    fp_path     = stem.with_suffix(".fp.txt")
-    lrc_path    = stem.with_suffix(".lrc.txt")
+    output_dir  = Path(args.output_dir)
+    mus_path    = output_dir / audio_path.with_suffix(".mus.txt").name
+    lrc_path    = output_dir / audio_path.with_suffix(".lrc.txt").name
 
     if not audio_path.exists():
         print(f"Error: audio file not found: {audio_path}")
@@ -462,12 +422,12 @@ def main() -> int:
         print(f"Error: unsupported lyrics format '{lyrics_path.suffix}' (expected .lrc)")
         return 1
 
-    lyrics_text = lyrics_path.read_text(encoding="utf-8")
+    lyrics_text   = lyrics_path.read_text(encoding="utf-8")
     lyric_entries = parse_lrc(lyrics_text)
-    meta = parse_lrc_meta(lyrics_text) or None
+    meta          = parse_lrc_meta(lyrics_text) or None
 
     # ── Load audio and compute global song-level properties ───────────────
-    y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
     sr = int(sr)
     audio_duration_ms = int(len(y) * 1000 / sr)
 
@@ -489,31 +449,23 @@ def main() -> int:
     }
 
     # ── Build segment timeline and analyse each segment ───────────────────
-    timeline_entries = build_full_timeline_entries(lyric_entries, audio_duration_ms)
-    timeline_entries = subdivide_segments(timeline_entries, SUBWINDOW_MS)
+    timeline = build_timeline(lyric_entries, audio_duration_ms)
 
-    fp_entries: List[SubtitleEntry] = []
-    for entry in timeline_entries:
+    fp_entries: list[SubtitleEntry] = []
+    for entry in timeline:
         start_sample = ms_to_sample(entry.start_ms, sr, len(y))
         end_sample   = ms_to_sample(entry.end_ms,   sr, len(y))
         segment      = y[start_sample:end_sample]
-
-        sound_desc = f"{tempo_token}, {analyze_segment(segment, sr)}"
-
-        fp_entries.append(SubtitleEntry(
-            index=0,
-            start_ms=entry.start_ms,
-            end_ms=entry.end_ms,
-            text=sound_desc,
-        ))
+        sound_desc   = f"{tempo_token}, {analyze_segment(segment, sr)}"
+        fp_entries.append(SubtitleEntry(entry.start_ms, entry.end_ms, sound_desc))
 
     # ── Write .fp.txt ─────────────────────────────────────────────────────
-    fp_path.parent.mkdir(parents=True, exist_ok=True)
-    fp_path.write_text(
+    mus_path.parent.mkdir(parents=True, exist_ok=True)
+    mus_path.write_text(
         write_fp_output(fp_entries, no_ts=args.no_ts, meta=meta, global_tokens=global_tokens),
         encoding="utf-8",
     )
-    print(f"Wrote acoustic fingerprint : {fp_path}")
+    print(f"Wrote acoustic fingerprint : {mus_path}")
 
     # ── Write .lrc.txt ────────────────────────────────────────────────────
     lrc_path.write_text(
