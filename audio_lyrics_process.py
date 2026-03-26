@@ -482,9 +482,12 @@ def process_song(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate acoustic fingerprint and lyrics files for a directory of songs.\n"
+            "Generate acoustic fingerprint and lyrics files for one song or a directory.\n"
             "\n"
-            "Scans input_dir for audio files and matches each with a same-stem .lrc file.\n"
+            "Single-file mode:  pass an audio file — a same-stem .lrc in the same\n"
+            "                   directory is used when present, otherwise instrumental.\n"
+            "Directory mode:    pass a directory — every audio file is processed and\n"
+            "                   matched with a same-stem .lrc in the same directory.\n"
             "Produces TWO output files per song:\n"
             "  <stem>.mus.txt  — acoustic fingerprint (for sound-similarity index)\n"
             "  <stem>.lrc.txt  — plain lyrics companion (for lyric-similarity index)\n"
@@ -494,7 +497,7 @@ def parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("input_dir",  help="Directory containing audio + .lrc pairs")
+    parser.add_argument("input",      help="Audio file or directory containing audio + .lrc pairs")
     parser.add_argument("output_dir", help="Directory where output files will be written")
     parser.add_argument(
         "-n", "--no-ts", action="store_true",
@@ -506,31 +509,38 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    input_dir  = Path(args.input_dir)
+    input_path = Path(args.input)
     output_dir = Path(args.output_dir)
 
-    if not input_dir.is_dir():
-        print(f"Error: input directory not found: {input_dir}")
+    if input_path.is_file():
+        # ── Single-file mode ──────────────────────────────────────────────
+        if input_path.suffix.lower() not in AUDIO_EXTENSIONS:
+            print(f"Error: unsupported audio format: {input_path.suffix}")
+            return 1
+        audio_files = [input_path]
+
+    elif input_path.is_dir():
+        # ── Directory mode ────────────────────────────────────────────────
+        audio_files = sorted(
+            p for p in input_path.iterdir()
+            if p.suffix.lower() in AUDIO_EXTENSIONS
+        )
+        if not audio_files:
+            print(f"Error: no audio files found in {input_path}")
+            return 1
+
+        # Warn about stem collisions (e.g. song.flac + song.mp3 → same output stem)
+        seen_stems: dict[str, Path] = {}
+        for p in audio_files:
+            if p.stem in seen_stems:
+                print(f"Warning: stem collision — {seen_stems[p.stem].name} and {p.name} share stem '{p.stem}'; {p.name} will be skipped")
+            else:
+                seen_stems[p.stem] = p
+        audio_files = list(seen_stems.values())
+
+    else:
+        print(f"Error: input not found: {input_path}")
         return 1
-
-    audio_files = sorted(
-        p for p in input_dir.iterdir()
-        if p.suffix.lower() in AUDIO_EXTENSIONS
-    )
-
-    if not audio_files:
-        print(f"Error: no audio files found in {input_dir}")
-        return 1
-
-    # Warn about stem collisions (e.g. song.flac + song.mp3 → same output stem)
-    seen_stems: dict[str, Path] = {}
-    for p in audio_files:
-        stem = p.stem
-        if stem in seen_stems:
-            print(f"Warning: stem collision — {seen_stems[stem].name} and {p.name} share stem '{stem}'; {p.name} will be skipped")
-        else:
-            seen_stems[stem] = p
-    audio_files = list(seen_stems.values())
 
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Processing {len(audio_files)} song(s) → {output_dir}")
