@@ -28,7 +28,16 @@ if [ -d "$src" ]; then
     total=$(echo "$audio_files" | wc -l)
 
     echo "Found $total audio files in directory '$src'."
+else
+    audio_files="$src"
+    total=1
 fi
+
+echo "Processing $total audio file(s) with lyrics..."
+
+echo "$audio_files" | while IFS= read -r audio_file; do
+    $script_dir/download_lyrics.sh "$audio_file"
+done
 
 python $script_dir/audio_lyrics_process.py "$src" "$output_dir" --no-ts
 

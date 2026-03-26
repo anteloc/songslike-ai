@@ -5,4 +5,8 @@ __pycache__/
 input.*
 output.*
 chroma_db/
+songs_db/
 claude-prompt.md
+claude-session-prompt.md
+.claude
+

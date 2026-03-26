@@ -13,7 +13,7 @@ DUAL-INDEX ARCHITECTURE
 
 Each song is indexed TWICE, in two separate ChromaDB collections:
 
-  <name>_acoustic  — built from .fp.txt files (acoustic fingerprints)
+  <name>_acoustic  — built from .mus.txt files (musical descriptors, SRT format)
   <name>_lyric     — built from .lrc.txt files (plain lyrics companions)
 
 At retrieval time both indexes are queried independently, then results
@@ -29,13 +29,13 @@ NOTE header (Tempo/Key/Mode), so they are never silently penalised.
 REQUIRED DIRECTORY LAYOUT FOR INDEXING
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Use --fp-dir and --lrc-dir to point at separate directories, OR keep both
+Use --mus-dir and --lrc-dir to point at separate directories, OR keep both
 file types together in a single directory (--dir).  Files are matched by
 their stem (the filename without extension):
 
-  104.AC_DC-Thunderstruck.fp.txt   ←→   104.AC_DC-Thunderstruck.lrc.txt
+  104.AC_DC-Thunderstruck.mus.txt   ←→   104.AC_DC-Thunderstruck.lrc.txt
 
-If a song has an .fp.txt but no matching .lrc.txt (or vice-versa) it is
+If a song has a .mus.txt but no matching .lrc.txt (or vice-versa) it is
 still indexed in the available collection — the missing collection simply
 contributes a score of 0.0 for that song at retrieval time.
 
@@ -43,125 +43,77 @@ contributes a score of 0.0 for that song at retrieval time.
 USAGE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  # Create indexes (optional — index does this automatically)
-  python rag_solution.py create <name>
-
-  # Index from a single directory containing both .fp.txt and .lrc.txt
-  python rag_solution.py index <name> --dir ./fps/
+  # Index from a single directory containing both .mus.txt and .lrc.txt
+  python rag.py index <index_base> --dir ./songs/
 
   # Index from separate directories
-  python rag_solution.py index <name> --fp-dir ./fps/ --lrc-dir ./lrcs/
+  python rag.py index <index_base> --mus-dir ./mus/ --lrc-dir ./lrcs/
 
-  # Retrieve similar songs using a fingerprint file as query
-  python rag_solution.py retrieve <name> --file song.fp.txt --top-k 10
+  # Index using a custom database path
+  python rag.py index <index_base> --dir ./songs/ --db ./my_db
+
+  # Retrieve similar songs using a .mus.txt file as query
+  # (companion .lrc.txt with the same stem is used automatically if present)
+  python rag.py retrieve <index_base> --file song.mus.txt --top-k 10
 
   # Retrieve with custom acoustic/lyric weight (0.0–1.0, default 0.6)
-  python rag_solution.py retrieve <name> --file song.fp.txt --alpha 0.7
+  python rag.py retrieve <index_base> --file song.mus.txt --alpha 0.7
 
   # Retrieve using a plain text question
-  python rag_solution.py retrieve <name> "fast minor key hard rock"
+  python rag.py retrieve <index_base> "fast minor key hard rock"
 
   # Estimate token counts for a directory
-  python rag_solution.py estimate --dir ./fps/
+  python rag.py estimate --dir ./songs/
 """
 
 import argparse
 import json
 import re
-from collections import Counter, defaultdict
+
 from pathlib import Path
 
 import chromadb
 import tiktoken
 from tqdm import tqdm
 
-from llama_index.core import VectorStoreIndex, Document
+from llama_index.core import VectorStoreIndex, Document, Settings
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core import StorageContext
+
+# Prevent LlamaIndex from chunking song documents — the default 1024-token limit
+# splits long acoustic arcs into partial fragments that fail to self-match at query time.
+# 10 240 tokens comfortably holds even the longest .mus.txt or .lrc.txt as one chunk.
+Settings.chunk_size = 10_240
 
 
 # ── 1. Index setup ────────────────────────────────────────────────────────────
 
-def _make_index(collection_name: str) -> VectorStoreIndex:
+def _make_index(collection_name: str, db_path: str) -> VectorStoreIndex:
     """Create (or reconnect to) one named ChromaDB-backed vector index."""
-    chroma_client = chromadb.PersistentClient(path="./chroma_db")
+    chroma_client = chromadb.PersistentClient(path=db_path)
     collection    = chroma_client.get_or_create_collection(collection_name)
     vector_store  = ChromaVectorStore(chroma_collection=collection)
     storage_ctx   = StorageContext.from_defaults(vector_store=vector_store)
     return VectorStoreIndex([], storage_context=storage_ctx)
 
 
-def get_indexes(name: str) -> tuple[VectorStoreIndex, VectorStoreIndex]:
-    """Return (acoustic_index, lyric_index) for the given base name."""
-    return _make_index(f"{name}_acoustic"), _make_index(f"{name}_lyric")
+def get_indexes(index_base: str, db_path: str) -> tuple[VectorStoreIndex, VectorStoreIndex]:
+    """Return (acoustic_index, lyric_index) for the given base name and database path."""
+    return _make_index(f"{index_base}_acoustic", db_path), _make_index(f"{index_base}_lyric", db_path)
 
 
-# ── 2. Prose conversion helpers ───────────────────────────────────────────────
+# ── 2. Parsing helpers ────────────────────────────────────────────────────────
 
-TOKEN_TO_DESC: dict[str, str] = {
-    # Tempo
-    "bpm:slow": "slow tempo",
-    "bpm:mid":  "mid tempo",
-    "bpm:fast": "fast tempo",
-    # Energy (4 tiers)
-    "DOOM": "very high energy",
-    "voom": "high energy",
-    "meh":  "moderate energy",
-    "hmm":  "low energy",
-    # Spectral centroid
-    "tsee":  "bright treble-heavy sound",
-    "tsing": "bright upper-midrange sound",
-    "bwoom": "dark bass-heavy sound",
-    # Tonal character
-    "bzzra": "noisy distorted timbre",
-    "ooh":   "pure tonal character",
-    # Harmonic vs. percussive
-    "tonal": "harmonically rich melodic character",
-    "noisy": "percussive or distorted character",
-    # Rhythmic
-    "tak-tak": "strong rhythmic percussive attacks",
-    "ahhh":    "smooth sustained character",
-    # Spectral spread
-    "shaa": "broad spectral spread",
-    # Peak frequency
-    "weee": "high-pitched dominant frequency",
-    "dum":  "bass dominant frequency",
-    # Silence / uncharacterized
-    "shhh": "silence",
-    "mmm":  "uncharacterized sound",
-    # Mode
-    "mode:major": "major key brighter mood",
-    "mode:minor": "minor key darker mood",
-}
-
-# Fix 2: map musical keys to tonal-character descriptions that the embedding
-# model understands, rather than opaque "B key" / "A key" labels.
-# Adjacent keys on the circle of fifths share similar descriptors so that
-# neighbouring keys score closer to each other than distant ones.
-_KEY_MOOD: dict[str, str] = {
-    "C":  "natural neutral tone",
-    "G":  "bright open tone",
-    "D":  "bright energetic tone",
-    "A":  "clear bright tone",
-    "E":  "sharp bright tone",
-    "B":  "tense bright tone",
-    "F#": "tense sharp tone",
-    "C#": "tense dark tone",
-    "G#": "dark mysterious tone",
-    "D#": "dark heavy tone",
-    "A#": "dark warm tone",
-    "F":  "warm mellow tone",
-}
-
-_KEY_TOKEN_RE   = re.compile(r"key:([A-G]#?)")
-_FP_TOKEN_RE    = re.compile(r"\{([^}]+)\}")
+# Matches "Tempo: ...", "Key: ...", "Mode: ..." lines in the NOTE block
 _NOTE_GLOBAL_RE = re.compile(r"^(Tempo|Key|Mode):\s*(.+)$")
 
-# Metadata prefixes to strip from the retrieval query
+# Matches the timestamp line in SRT segments: "HH:MM:SS,ms --> ..."
+_TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d+\s+-->")
+
+# Metadata prefixes to strip from the retrieval query (avoids self-matching by name)
 _METADATA_PREFIXES = ("Artist:", "Title:", "Album:", "NOTE")
 
-# Fix 3: stop-words to filter from lyric prose so that grammatical glue words
-# don't inflate similarity between thematically unrelated songs.
+# Stop-words filtered from lyric prose so grammatical glue words don't inflate similarity
 _LYRIC_STOPWORDS = {
     "the", "a", "an", "i", "you", "we", "they", "he", "she", "it",
     "and", "or", "but", "in", "on", "at", "to", "of", "for", "with",
@@ -173,12 +125,28 @@ _LYRIC_STOPWORDS = {
 }
 
 
-def _key_to_desc(token: str) -> str:
-    """Convert e.g. 'key:B' -> 'tense bright tone'."""
-    m = _KEY_TOKEN_RE.match(token)
-    if m:
-        return _KEY_MOOD.get(m.group(1), f"{m.group(1)} key")
-    return token
+def _parse_note_block(text: str) -> list[str]:
+    """
+    Extract Tempo/Key/Mode descriptors from the NOTE block.
+
+    Values are already plain text (e.g. "mid tempo", "A", "minor") — they are
+    returned as-is, except Key which gets a " key" suffix for clarity.
+    """
+    descs: list[str] = []
+    in_note = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s == "NOTE":
+            in_note = True
+            continue
+        if in_note:
+            if not s:
+                break
+            m = _NOTE_GLOBAL_RE.match(s)
+            if m:
+                field, value = m.group(1), m.group(2).strip()
+                descs.append(f"{value} key" if field == "Key" else value)
+    return descs
 
 
 def _clean_lyric_line(line: str) -> str:
@@ -191,66 +159,64 @@ def _clean_lyric_line(line: str) -> str:
     return " ".join(meaningful)
 
 
-def _parse_note_block(fp_text: str) -> list[str]:
-    """Extract Tempo/Key/Mode global descriptors from the NOTE block."""
-    descs: list[str] = []
-    in_note = False
-    for line in fp_text.splitlines():
+def _strip_metadata_from_prose(prose: str) -> str:
+    """Remove artist/title/album/NOTE lines from a prose string (used at query time)."""
+    return "\n".join(
+        line for line in prose.splitlines()
+        if not any(line.strip().startswith(p) for p in _METADATA_PREFIXES)
+    )
+
+
+# ── 3a. Acoustic prose ────────────────────────────────────────────────────────
+
+def mus_to_acoustic_prose(mus_text: str) -> str:
+    """
+    Convert a .mus.txt file to natural-language prose for the acoustic index.
+
+    The NOTE block provides song-level properties (Tempo/Key/Mode), repeated
+    twice so the embedding model weights them more heavily.
+
+    Each SRT segment's descriptor line is preserved in order and joined as a
+    temporal arc ("Arc: ...") separated by " — ".  Keeping the full chronological
+    sequence makes each song's acoustic document unique: two songs may share the
+    same vocabulary yet differ in *when* they are loud, bright, sparse, etc.
+    This ensures a query built from the same file always self-matches near 1.0.
+    """
+    global_descs = _parse_note_block(mus_text)
+
+    # Walk lines after the NOTE block; collect each descriptor line as one segment.
+    # Segment format: <integer> / <timestamp> / <comma-separated descriptors> / <blank>
+    in_note   = False
+    note_done = False
+    segments: list[str] = []
+
+    for line in mus_text.splitlines():
         s = line.strip()
         if s == "NOTE":
             in_note = True
             continue
         if in_note:
             if not s:
-                break
-            m = _NOTE_GLOBAL_RE.match(s)
-            if m:
-                for tok in m.group(2).strip().split():
-                    if tok in TOKEN_TO_DESC:
-                        descs.append(TOKEN_TO_DESC[tok])
-                    elif _KEY_TOKEN_RE.match(tok):
-                        descs.append(_key_to_desc(tok))
-    return descs
-
-
-# ── 3a. Acoustic prose ────────────────────────────────────────────────────────
-
-def fp_to_acoustic_prose(fp_text: str) -> str:
-    """
-    Convert a .fp.txt file to natural-language prose for the acoustic index.
-
-    Only acoustic token distributions and song-level properties (Tempo/Key/Mode)
-    are used.  Lyric text is completely ignored here — it lives in the lyric index.
-
-    The global song properties are repeated twice at the top of the prose so that
-    the embedding model weights them more heavily than per-segment token counts.
-    """
-    global_descs = _parse_note_block(fp_text)
-
-    all_tokens: list[str] = []
-    for m in _FP_TOKEN_RE.finditer(fp_text):
-        all_tokens.extend(m.group(1).split())
+                in_note   = False
+                note_done = True
+            continue
+        if not note_done or not s:
+            continue
+        if s.isdigit() or _TIMESTAMP_RE.match(s):
+            continue
+        # Descriptor line — normalise commas to spaces to keep prose clean
+        terms = " ".join(t.strip() for t in s.split(",") if t.strip())
+        segments.append(terms)
 
     parts: list[str] = []
 
     if global_descs:
         g = ", ".join(global_descs)
-        parts.append(f"Song characteristics: {g}.")
+        parts.append(f"Song: {g}.")
         parts.append(f"Overall feel: {g}.")
 
-    if all_tokens:
-        counts = Counter(all_tokens)
-        total  = len(all_tokens)
-        chars  = []
-        for token, count in counts.most_common():
-            if count / total < 0.03:
-                break
-            if token in TOKEN_TO_DESC:
-                chars.append(TOKEN_TO_DESC[token])
-            elif _KEY_TOKEN_RE.match(token):
-                chars.append(_key_to_desc(token))
-        if chars:
-            parts.append("Music characteristics: " + ", ".join(chars) + ".")
+    if segments:
+        parts.append("Arc: " + " — ".join(segments) + ".")
 
     return "\n".join(parts)
 
@@ -307,28 +273,20 @@ def lrc_to_lyric_prose(lrc_text: str) -> str:
     return "\n".join(parts)
 
 
-def _strip_metadata_from_prose(prose: str) -> str:
-    """Remove artist/title/album lines from a prose string (used at query time)."""
-    return "\n".join(
-        line for line in prose.splitlines()
-        if not any(line.strip().startswith(p) for p in _METADATA_PREFIXES)
-    )
-
-
 # ── 4. Indexing ───────────────────────────────────────────────────────────────
 
 def _stem(path: Path) -> str:
     """
     Return a canonical song stem from a file path, stripping both the file
-    extension and the type suffix (.fp or .lrc).
+    extension and the type suffix (.mus or .lrc).
 
     Examples
     --------
-    104.AC_DC-Thunderstruck.fp.txt  ->  104.AC_DC-Thunderstruck
-    104.AC_DC-Thunderstruck.lrc.txt ->  104.AC_DC-Thunderstruck
+    104.AC_DC-Thunderstruck.mus.txt  ->  104.AC_DC-Thunderstruck
+    104.AC_DC-Thunderstruck.lrc.txt  ->  104.AC_DC-Thunderstruck
     """
     name = path.name
-    for suffix in (".fp.txt", ".lrc.txt"):
+    for suffix in (".mus.txt", ".lrc.txt"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return path.stem
@@ -337,32 +295,36 @@ def _stem(path: Path) -> str:
 def index_directories(
     acoustic_index: VectorStoreIndex,
     lyric_index:    VectorStoreIndex,
-    fp_dir:  Path | None,
-    lrc_dir: Path | None,
+    mus_dir:  Path | None,
+    lrc_dir:  Path | None,
 ) -> None:
     """
     Populate the acoustic and lyric indexes from their respective directories.
 
-    fp_dir  — directory containing .fp.txt  files  (acoustic fingerprints)
+    mus_dir — directory containing .mus.txt files  (musical descriptors)
     lrc_dir — directory containing .lrc.txt files  (lyrics companions)
 
     Either directory may be None if only one type is being re-indexed.
     Files that match neither pattern are silently skipped.
     """
-    if fp_dir:
-        fp_paths = sorted(p for p in fp_dir.iterdir() if p.is_file() and p.name.endswith(".fp.txt"))
-        fp_docs  = []
-        for path in fp_paths:
-            prose = fp_to_acoustic_prose(path.read_text(encoding="utf-8", errors="ignore"))
+    if mus_dir:
+        mus_paths = sorted(p for p in mus_dir.iterdir() if p.is_file() and p.name.endswith(".mus.txt"))
+        mus_docs  = []
+        for path in mus_paths:
+            prose = mus_to_acoustic_prose(path.read_text(encoding="utf-8", errors="ignore"))
             if prose:
-                fp_docs.append(Document(
+                meta = {"file_path": str(path), "file_name": path.name, "stem": _stem(path)}
+                mus_docs.append(Document(
                     text=prose,
                     id_=str(path),
-                    metadata={"file_path": str(path), "file_name": path.name, "stem": _stem(path)},
+                    metadata=meta,
+                    # Keep metadata out of the embedding — only the prose is embedded,
+                    # so query text (same prose, no metadata) matches the stored vector exactly.
+                    excluded_embed_metadata_keys=list(meta.keys()),
                 ))
-        for doc in tqdm(fp_docs, desc="Indexing acoustic", unit="doc"):
+        for doc in tqdm(mus_docs, desc="Indexing acoustic", unit="doc"):
             acoustic_index.insert(doc)
-        print(f"Indexed {len(fp_docs)} acoustic document(s) from '{fp_dir}'")
+        print(f"Indexed {len(mus_docs)} acoustic document(s) from '{mus_dir}'")
 
     if lrc_dir:
         lrc_paths = sorted(p for p in lrc_dir.iterdir() if p.is_file() and p.name.endswith(".lrc.txt"))
@@ -370,10 +332,12 @@ def index_directories(
         for path in lrc_paths:
             prose = lrc_to_lyric_prose(path.read_text(encoding="utf-8", errors="ignore"))
             if prose:
+                meta = {"file_path": str(path), "file_name": path.name, "stem": _stem(path)}
                 lrc_docs.append(Document(
                     text=prose,
                     id_=str(path),
-                    metadata={"file_path": str(path), "file_name": path.name, "stem": _stem(path)},
+                    metadata=meta,
+                    excluded_embed_metadata_keys=list(meta.keys()),
                 ))
         for doc in tqdm(lrc_docs, desc="Indexing lyrics  ", unit="doc"):
             lyric_index.insert(doc)
@@ -497,29 +461,27 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     fmt = argparse.RawDescriptionHelpFormatter
 
-    # create
-    p_create = sub.add_parser("create", help="Create empty named acoustic + lyric indexes.",
-                               formatter_class=fmt,
-                               epilog="example:\n  python rag_solution.py create songs")
-    p_create.add_argument("name")
-
     # index
     p_index = sub.add_parser(
         "index",
-        help="Populate acoustic and/or lyric indexes from directories.",
+        help="Populate acoustic and/or lyric indexes from directories (creates if needed).",
         formatter_class=fmt,
         epilog=(
             "examples:\n"
-            "  # single dir with both .fp.txt and .lrc.txt files\n"
-            "  python rag_solution.py index songs --dir ./fps/\n\n"
+            "  # single dir with both .mus.txt and .lrc.txt files\n"
+            "  python rag.py index songs --dir ./songs/\n\n"
             "  # separate dirs\n"
-            "  python rag_solution.py index songs --fp-dir ./fps/ --lrc-dir ./lrcs/\n"
+            "  python rag.py index songs --mus-dir ./mus/ --lrc-dir ./lrcs/\n\n"
+            "  # custom db path\n"
+            "  python rag.py index songs --dir ./songs/ --db ./my_db\n"
         ),
     )
-    p_index.add_argument("name")
-    p_index.add_argument("--dir",     metavar="DIR",     help="Directory containing both .fp.txt and .lrc.txt files")
-    p_index.add_argument("--fp-dir",  metavar="FP_DIR",  help="Directory containing .fp.txt files only")
+    p_index.add_argument("index_base")
+    p_index.add_argument("--dir",     metavar="DIR",     help="Directory containing both .mus.txt and .lrc.txt files")
+    p_index.add_argument("--mus-dir", metavar="MUS_DIR", help="Directory containing .mus.txt files only")
     p_index.add_argument("--lrc-dir", metavar="LRC_DIR", help="Directory containing .lrc.txt files only")
+    p_index.add_argument("--db",      metavar="DB",      default="./songs_db",
+                         help="ChromaDB storage path (default: ./songs_db)")
 
     # retrieve
     p_retrieve = sub.add_parser(
@@ -528,16 +490,17 @@ def main() -> None:
         formatter_class=fmt,
         epilog=(
             "examples:\n"
-            "  python rag_solution.py retrieve songs --file song.fp.txt --top-k 10\n"
-            "  python rag_solution.py retrieve songs --file song.fp.txt --alpha 0.8\n"
-            "  python rag_solution.py retrieve songs \"fast minor key hard rock\" --top-k 5\n"
+            "  python rag.py retrieve songs --file song.mus.txt --top-k 10\n"
+            "  python rag.py retrieve songs --file song.mus.txt --alpha 0.8\n"
+            "  python rag.py retrieve songs \"fast minor key hard rock\" --top-k 5\n"
+            "  python rag.py retrieve songs --file song.mus.txt --db ./my_db\n"
         ),
     )
-    p_retrieve.add_argument("name")
+    p_retrieve.add_argument("index_base")
     p_retrieve.add_argument("question", nargs="?", default=None,
                              help="Free-text query (used for both acoustic and lyric indexes)")
     p_retrieve.add_argument("--file",  "-F", metavar="FILE",
-                             help="Use a .fp.txt fingerprint as the query")
+                             help="Use a .mus.txt file as the query; companion .lrc.txt is used automatically if present")
     p_retrieve.add_argument("--top-k", type=int, default=10, metavar="K")
     p_retrieve.add_argument(
         "--alpha", type=float, default=0.6, metavar="A",
@@ -547,11 +510,13 @@ def main() -> None:
                              help="Output metadata JSON instead of score table")
     p_retrieve.add_argument("--scores",   "-s", action="store_true",
                              help="Show individual acoustic/lyric scores alongside final score")
+    p_retrieve.add_argument("--db",      metavar="DB",      default="./songs_db",
+                             help="ChromaDB storage path (default: ./songs_db)")
 
     # estimate
     p_estimate = sub.add_parser("estimate", help="Estimate token counts for files in a directory.",
                                  formatter_class=fmt,
-                                 epilog="example:\n  python rag_solution.py estimate --dir ./fps/")
+                                 epilog="example:\n  python rag.py estimate --dir ./songs/")
     p_estimate.add_argument("--dir", metavar="DIR", required=True)
 
     args = parser.parse_args()
@@ -561,39 +526,34 @@ def main() -> None:
         estimate_directory(Path(args.dir))
         return
 
-    acoustic_index, lyric_index = get_indexes(args.name)
-
-    # ── create ────────────────────────────────────────────────────────────
-    if args.cmd == "create":
-        print(f"Indexes '{args.name}_acoustic' and '{args.name}_lyric' ready.")
-        return
+    acoustic_index, lyric_index = get_indexes(args.index_base, args.db)
 
     # ── index ─────────────────────────────────────────────────────────────
     if args.cmd == "index":
         if args.dir:
             d = Path(args.dir)
-            index_directories(acoustic_index, lyric_index, fp_dir=d, lrc_dir=d)
+            index_directories(acoustic_index, lyric_index, mus_dir=d, lrc_dir=d)
         else:
-            fp_dir  = Path(args.fp_dir)  if args.fp_dir  else None
+            mus_dir = Path(args.mus_dir) if args.mus_dir else None
             lrc_dir = Path(args.lrc_dir) if args.lrc_dir else None
-            if not fp_dir and not lrc_dir:
-                parser.error("index requires --dir, --fp-dir, or --lrc-dir")
-            index_directories(acoustic_index, lyric_index, fp_dir=fp_dir, lrc_dir=lrc_dir)
+            if not mus_dir and not lrc_dir:
+                parser.error("index requires --dir, --mus-dir, or --lrc-dir")
+            index_directories(acoustic_index, lyric_index, mus_dir=mus_dir, lrc_dir=lrc_dir)
         return
 
     # ── retrieve ──────────────────────────────────────────────────────────
     if args.cmd == "retrieve":
         if args.file:
-            fp_text       = Path(args.file).read_text(encoding="utf-8")
-            acoustic_query = _strip_metadata_from_prose(fp_to_acoustic_prose(fp_text))
+            mus_path   = Path(args.file)
+            mus_text   = mus_path.read_text(encoding="utf-8")
+            acoustic_query = _strip_metadata_from_prose(mus_to_acoustic_prose(mus_text))
 
-            # Derive the companion .lrc.txt path from the .fp.txt path and use
+            # Derive the companion .lrc.txt path from the .mus.txt path and use
             # it for the lyric query if it exists; otherwise fall back to the
             # acoustic query (the NOTE header alone still provides useful signal).
-            fp_path  = Path(args.file)
-            lrc_path = fp_path.with_suffix("").with_suffix(".lrc.txt")
+            lrc_path = mus_path.with_suffix("").with_suffix(".lrc.txt")
             if lrc_path.exists():
-                lrc_text   = lrc_path.read_text(encoding="utf-8")
+                lrc_text    = lrc_path.read_text(encoding="utf-8")
                 lyric_query = _strip_metadata_from_prose(lrc_to_lyric_prose(lrc_text))
             else:
                 lyric_query = acoustic_query
@@ -629,4 +589,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
