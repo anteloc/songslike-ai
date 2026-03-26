@@ -383,6 +383,70 @@ def analyze_segment(
     return ", ".join(parts) if parts else "uncharacterized"
 
 
+# ── Instrumentation detection ─────────────────────────────────────────────────
+
+def detect_instrumentation(
+    S_full:      np.ndarray,   # magnitude STFT [n_bins, n_frames]
+    H_full:      np.ndarray,   # harmonic component from HPSS
+    P_full:      np.ndarray,   # percussive component from HPSS
+    zcr_full:    np.ndarray,   # ZCR frames
+    beat_frames: np.ndarray,   # beat frame indices (from beat_track)
+    freqs:       np.ndarray,   # frequency bin centers
+    sr:          int,
+) -> str:
+    """Heuristically identify dominant instruments from precomputed audio features.
+
+    All inputs are already computed in process_song — no extra I/O or audio loading.
+    spectral_flatness and spectral_bandwidth are cheap one-pass STFT operations.
+
+    Detected tags (may combine):
+      electric guitar — high flatness + ZCR + 200–800 Hz body
+      synthesizer     — very tonal, narrow bandwidth, high harmonic purity
+      drums           — percussive energy dominant, irregular beat spacing
+      drum machine    — percussive energy dominant, highly regular beat spacing
+
+    Returns a comma-separated string, or "" if no tag is confident enough.
+    """
+    eps = 1e-10
+
+    mean_zcr       = float(zcr_full.mean())
+    mean_harm_ratio = float(np.mean(H_full ** 2)) / (float(np.mean(S_full ** 2)) + eps)
+    perc_ratio      = float(np.mean(P_full ** 2)) / (float(np.mean(S_full ** 2)) + eps)
+    mean_flatness   = float(librosa.feature.spectral_flatness(S=S_full).mean())
+    mean_bandwidth  = float(librosa.feature.spectral_bandwidth(S=S_full, sr=sr).mean())
+
+    # 200–800 Hz: power-chord / guitar body range
+    low_mid_mask = (freqs >= 200) & (freqs <= 800)
+    warmth_ratio = float(S_full[low_mid_mask].mean()) / (float(S_full.mean()) + eps)
+
+    tags: list[str] = []
+
+    # Electric guitar: ZCR is the primary discriminant — distortion creates many
+    # zero crossings even though the spectrum remains structured (low flatness).
+    # flatness > 0.03 excludes purely orchestral/tonal sources (e.g. strings, pads).
+    if mean_flatness > 0.03 and mean_zcr > 0.12 and warmth_ratio > 1.1:
+        tags.append("electric guitar")
+
+    # Synthesizer: tonally pure (low flatness + low ZCR) but with at least some
+    # percussive energy — this gates out purely orchestral/vocal sources like Enya
+    # which have similarly low flatness/ZCR but almost no percussion (perc_ratio ~0.05).
+    if mean_zcr < 0.11 and mean_flatness < 0.03 and perc_ratio > 0.10:
+        tags.append("synthesizer")
+
+    # Drums / drum machine: any meaningful percussive energy fraction.
+    # Regularity threshold tightened to 0.03: Maniac's drum machine sits at ~0.027,
+    # live kits (Thunderstruck) at ~0.035 — just enough separation.
+    if perc_ratio > 0.15:
+        if beat_frames.size > 2:
+            intervals  = np.diff(beat_frames.astype(float))
+            regularity = float(np.std(intervals) / (np.mean(intervals) + eps))
+            tags.append("drum machine" if regularity < 0.03 else "drums")
+        else:
+            tags.append("drums")
+
+    return ", ".join(tags)
+
+
 # ── Per-song processing ───────────────────────────────────────────────────────
 
 # Audio formats recognised when scanning an input directory
@@ -420,14 +484,15 @@ def process_song(
     # ── Precompute all expensive features once from the full audio ────────
     # Every per-segment call previously recomputed STFT, HPSS, onset, and ZCR.
     # Here we compute each once and slice by frame range inside the loop.
-    S_full    = np.abs(librosa.stft(y, hop_length=HOP_LENGTH))
-    H_full, _ = librosa.decompose.hpss(S_full)
-    zcr_full  = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
+    S_full          = np.abs(librosa.stft(y, hop_length=HOP_LENGTH))
+    H_full, P_full  = librosa.decompose.hpss(S_full)   # keep P_full for instrumentation
+    zcr_full        = librosa.feature.zero_crossing_rate(y, hop_length=HOP_LENGTH)[0]
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=HOP_LENGTH)
     freqs     = librosa.fft_frequencies(sr=sr, n_fft=(S_full.shape[0] - 1) * 2)
 
     # ── Global song-level properties ──────────────────────────────────────
-    tempo_val, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH)
+    tempo_val, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=HOP_LENGTH)
+    beat_frames = np.atleast_1d(beat_frames)
     bpm = float(np.atleast_1d(tempo_val)[0])
     if bpm < 90:
         tempo_token = "slow tempo"
@@ -438,11 +503,15 @@ def process_song(
 
     key_name, mode_name = detect_key_and_mode(S_full, sr)
 
+    instrumentation = detect_instrumentation(S_full, H_full, P_full, zcr_full, beat_frames, freqs, sr)
+
     global_tokens: dict[str, str] = {
         "Tempo": tempo_token,
         "Key":   key_name,
         "Mode":  mode_name,
     }
+    if instrumentation:
+        global_tokens["Instrumentation"] = instrumentation
 
     # ── Build segment timeline and analyse each segment ───────────────────
     timeline = build_timeline(lyric_entries, audio_duration_ms)

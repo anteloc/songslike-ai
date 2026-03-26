@@ -104,8 +104,11 @@ def get_indexes(index_base: str, db_path: str) -> tuple[VectorStoreIndex, Vector
 
 # ── 2. Parsing helpers ────────────────────────────────────────────────────────
 
-# Matches "Tempo: ...", "Key: ...", "Mode: ..." lines in the NOTE block
-_NOTE_GLOBAL_RE = re.compile(r"^(Tempo|Key|Mode):\s*(.+)$")
+# Matches "Tempo: ...", "Key: ...", "Mode: ...", "Instrumentation: ..." lines in the NOTE block
+_NOTE_GLOBAL_RE = re.compile(r"^(Tempo|Key|Mode|Instrumentation):\s*(.+)$")
+
+# Used in mus_to_acoustic_prose to give instrumentation an extra repetition
+_INSTRUMENTATION_RE = re.compile(r"^Instrumentation:\s*(.+)$", re.MULTILINE)
 
 # Matches the timestamp line in SRT segments: "HH:MM:SS,ms --> ..."
 _TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d+\s+-->")
@@ -217,6 +220,12 @@ def mus_to_acoustic_prose(mus_text: str) -> str:
 
     if segments:
         parts.append("Arc: " + " — ".join(segments) + ".")
+
+    # Instrumentation gets a third repetition — it's the primary timbre discriminant
+    # and would otherwise appear only twice (inside "Song:" and "Overall feel:").
+    m = _INSTRUMENTATION_RE.search(mus_text)
+    if m:
+        parts.append(f"Instrumentation: {m.group(1).strip()}.")
 
     return "\n".join(parts)
 
